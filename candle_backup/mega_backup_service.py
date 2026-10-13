@@ -4,9 +4,13 @@ Uses the vendored ``mega_local`` package — no external MEGA SDK.
 
 Design
 ------
-* The entire ``data/`` tree is compressed into a single ``.zip`` file
-  and uploaded as one object. This keeps the remote folder tidy and
+* The entire ``data/`` directory is compressed into a single ``data.zip``
+  file and uploaded as one object. This keeps the remote folder tidy and
   makes the backup trivially downloadable for consumers.
+* The zip contains the **contents** of ``data/`` directly at its root —
+  ``index/``, ``nifty/``, ``sensex/``, etc. — not a wrapping ``data/``
+  folder. Downloading and unzipping gives the same layout as the local
+  ``data/`` directory.
 * The remote folder is delete-then-recreate on every call so a stale
   archive never lingers next to the fresh one.
 * A small ``_manifest.txt`` is written **inside** the zip before upload
@@ -80,25 +84,33 @@ def _count_files(root: Path) -> int:
     return sum(1 for p in root.rglob("*") if p.is_file())
 
 
-def _build_archive(
-    data_dir: Path, temp_dir: Path
-) -> tuple[Path, str]:
-    """Zip ``data_dir`` into ``temp_dir``; return (archive_path, archive_name).
+def _build_archive(data_dir: Path, temp_dir: Path) -> Path:
+    """Zip the *contents* of ``data_dir`` into ``temp_dir/data.zip``.
 
-    The archive contains the top-level directory name (``data/...``)
-    plus a ``_manifest.txt`` at its root.
+    The archive is always named ``data.zip`` and contains the entries
+    inside ``data_dir`` directly at its root::
+
+        data.zip
+        ├── index/
+        ├── nifty/
+        ├── sensex/
+        └── _manifest.txt
+
+    A ``_manifest.txt`` entry is appended at the top level with the
+    upload time, source directory name, and file count.
     """
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    archive_name = f"candles_{ts}"
-    archive_base = temp_dir / archive_name
+    archive_base = temp_dir / "data"
 
     logger.info("Creating zip archive from %s", data_dir)
+
+    # root_dir=data_dir, base_dir defaults to '.' which is interpreted
+    # relative to root_dir — so the archive contains the *contents* of
+    # data_dir, not a wrapping 'data' folder.
     archive_path = Path(
         shutil.make_archive(
             base_name=str(archive_base),
             format="zip",
-            root_dir=str(data_dir.parent),
-            base_dir=data_dir.name,
+            root_dir=str(data_dir),
         )
     )
 
@@ -111,7 +123,7 @@ def _build_archive(
     with zipfile.ZipFile(archive_path, "a", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("_manifest.txt", manifest)
 
-    return archive_path, archive_path.name
+    return archive_path
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +134,7 @@ def backup_to_mega(
     folder: str | None = None,
     data_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Zip ``data_dir`` and upload the archive to MEGA under ``folder``.
+    """Zip ``data_dir`` into ``data.zip`` and upload it to MEGA.
 
     The remote folder is deleted and recreated before the upload so a
     stale archive from a previous run never lingers alongside the new
@@ -142,7 +154,8 @@ def backup_to_mega(
     # removed as soon as the ``with`` block exits — the .zip never
     # leaks into the repository.
     with tempfile.TemporaryDirectory(prefix="candle_backup_") as tmp:
-        archive_path, archive_name = _build_archive(data_dir, Path(tmp))
+        archive_path = _build_archive(data_dir, Path(tmp))
+        archive_name = archive_path.name          # always "data.zip"
         archive_size = archive_path.stat().st_size
 
         logger.info(

@@ -17,6 +17,13 @@ Runs only when the current time (in ``settings.market_timezone``) is a
 weekday between ``settings.market_open_time`` and
 ``settings.market_close_time``. Uses the V3 intraday REST endpoint and
 merges the result into the same ``historical.json``.
+
+When ``INTRADAY_TEST_MODE=true`` the market-hours gate is bypassed
+entirely: the intraday step runs regardless of the day or time. This is
+useful for CI runs that happen before the market opens, and for manual
+verification. Note that the upstream endpoint will still return an
+empty list if there is no data for the current day — the flag only
+controls whether we *attempt* the fetch, not whether data exists.
 """
 
 from __future__ import annotations
@@ -79,6 +86,14 @@ class HistoricalCandleStore:
         return datetime.now(tz)
 
     def is_market_hours(self) -> bool:
+        """Return True if the current time is inside the market window.
+
+        When ``INTRADAY_TEST_MODE`` is true, this always returns True so
+        the intraday step runs regardless of day or time.
+        """
+        if settings.intraday_test_mode:
+            return True
+
         now = self._now_market_tz()
         if now.weekday() >= 5:
             return False
@@ -193,6 +208,8 @@ class HistoricalCandleStore:
     ) -> dict[str, Any]:
         async with self._lock:
             now_local = self._now_market_tz()
+            test_mode = settings.intraday_test_mode
+
             if not self.is_market_hours():
                 summary = {
                     "reason": reason,
@@ -204,9 +221,17 @@ class HistoricalCandleStore:
                         f"{settings.market_timezone})"
                     ),
                     "now_market_tz": now_local.isoformat(),
+                    "test_mode": test_mode,
                 }
                 logger.info("Intraday candle job skipped; %s", summary)
                 return summary
+
+            if test_mode:
+                logger.info(
+                    "Intraday candle job running in TEST MODE; "
+                    "market-hours gate bypassed; now=%s",
+                    now_local.isoformat(),
+                )
 
             self.intraday_updated_count = 0
             self.intraday_empty_count = 0
@@ -234,6 +259,7 @@ class HistoricalCandleStore:
             summary = {
                 "reason": reason,
                 "skipped": False,
+                "test_mode": test_mode,
                 "total": self._intraday_total_count,
                 "processed": self._intraday_processed_count,
                 "updated": self.intraday_updated_count,

@@ -1,11 +1,10 @@
 name: Backup candles to MEGA
 
 on:
-  # Run on every push to the default branches. Adjust the branch list
-  # if you push to other long-lived branches (e.g. "develop").
   push:
     branches:
       - main
+      - master
 
   schedule:
     # 05:00 IST (Asia/Kolkata) Monday–Saturday.
@@ -20,6 +19,10 @@ on:
         description: "Optional note for manual runs"
         required: false
         default: "manual"
+      intraday_test_mode:
+        description: "Run the intraday fetch outside market hours? (true/false)"
+        required: false
+        default: "false"
 
 concurrency:
   # Never run two backups at once: they would fight over the same
@@ -56,6 +59,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MEGA_BACKUP_FOLDER_OVERRIDE: ${{ vars.MEGA_BACKUP_FOLDER }}
+          # Defaults to "false" for scheduled and push runs; only the
+          # workflow_dispatch input can turn it on.
+          INTRADAY_TEST_MODE: ${{ github.event.inputs.intraday_test_mode || 'true' }}
         run: |
           : "${SUBSCRIPTIONS_API_URL:?SUBSCRIPTIONS_API_URL secret is required}"
           : "${MEGA_EMAIL:?MEGA_EMAIL secret is required}"
@@ -83,6 +89,7 @@ jobs:
           MARKET_TIMEZONE=Asia/Kolkata
           MARKET_OPEN_TIME=09:15
           MARKET_CLOSE_TIME=15:40
+          INTRADAY_TEST_MODE=${INTRADAY_TEST_MODE}
           MEGA_ENABLED=true
           MEGA_EMAIL=${MEGA_EMAIL}
           MEGA_PASSWORD=${MEGA_PASSWORD}
@@ -97,6 +104,7 @@ jobs:
           echo "SUBSCRIPTIONS_API_URL set (length ${#SUBSCRIPTIONS_API_URL})"
           echo "MEGA_BACKUP_FOLDER=${MEGA_BACKUP_FOLDER}"
           echo "TELEGRAM_ENABLED=${TELEGRAM_ENABLED}"
+          echo "INTRADAY_TEST_MODE=${INTRADAY_TEST_MODE}"
 
       - name: Fetch candles and upload to MEGA
         run: python -m candle_backup

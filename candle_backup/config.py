@@ -55,6 +55,14 @@ class Settings:
     market_open_time: str = os.getenv("MARKET_OPEN_TIME", "09:15")
     market_close_time: str = os.getenv("MARKET_CLOSE_TIME", "15:40")
 
+    # Intraday test mode.
+    #   true  -> the intraday candle fetch runs even outside the market
+    #            window. Intended for manual verification and for CI runs
+    #            that happen before the market opens.
+    #   false -> the intraday step is skipped outside the market window
+    #            (default).
+    intraday_test_mode: bool = _env_bool("INTRADAY_TEST_MODE", False)
+
     # MEGA backup.
     mega_enabled: bool = _env_bool("MEGA_ENABLED", True)
     mega_email: str = _env_str("MEGA_EMAIL", "")
