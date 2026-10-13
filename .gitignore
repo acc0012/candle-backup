@@ -1,0 +1,68 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+.venv/
+venv/
+myenv/
+*.egg-info/
+build/
+dist/
+
+# Runtime output and generated data
+logs*/
+test_logs/
+data/
+meta_data/
+downloads/
+output/
+temp/
+*.pid
+*.log
+*.jsonl
+*.sqlite3
+.pytest_cache/
+.coverage*
+htmlcov/
+
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+.venv/
+venv/
+myenv/
+*.egg-info/
+build/
+dist/
+files.txt
+
+# Runtime output
+logs*/
+data/
+meta_data/
+temp/
+output/
+*.pid
+*.log
+*.jsonl
+.pytest_cache/
+.coverage*
+htmlcov/
