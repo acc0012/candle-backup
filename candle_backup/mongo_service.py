@@ -7,8 +7,35 @@ created:
     The full run metadata plus the MEGA public link of the archive.
 
 * ``MONGO_BLOB_COLLECTION`` / ``MONGO_BLOB_DOC_ID``
-    The archive bytes, stored as ``bson.Binary``. Only written when the
-    archive is smaller than ``MONGO_MAX_BLOB_MB``.
+    Either the archive bytes (stored as ``bson.Binary``) when the
+    archive fits under ``MONGO_MAX_BLOB_MB``, or a metadata-only
+    document that points the consumer at the MEGA share link when it
+    does not.
+
+The blob document is always present. Its shape depends on size:
+
+    # Small enough — binary stored
+    {
+      _id: "backup_historical_candles",
+      archive_name: "data.zip",
+      archive_size_bytes: 2036147,
+      data: BinData(0, "..."),
+      file_link: "https://mega.co.nz/#!...",
+      status: "saved",
+      ...
+    }
+
+    # Too large — no binary, but metadata + link
+    {
+      _id: "backup_historical_candles",
+      archive_name: "data.zip",
+      archive_size_bytes: 62914560,
+      data: null,
+      file_link: "https://mega.co.nz/#!...",
+      status: "skipped-size",
+      note: "Backup archive (60.0 MB) exceeds the 15 MB Mongo blob limit. Download it through the shared link in 'file_link'.",
+      ...
+    }
 
 Timestamps
 ----------
@@ -17,8 +44,7 @@ Every document carries two timestamp fields:
 * ``updated_at``      — a human-readable India Standard Time string,
                         e.g. ``"2026-10-13 18:13:27 IST"``.
 * ``updated_at_utc``  — the same instant as a timezone-aware UTC
-                        ``datetime`` so it stays sortable / indexable
-                        and can be range-queried.
+                        ``datetime`` so it stays sortable / indexable.
 
 Every function is best-effort: a MongoDB failure is logged and swallowed
 so the backup itself never fails because of Mongo. All clients are
@@ -46,8 +72,6 @@ logger = get_logger(__name__)
 # Time helpers
 # ---------------------------------------------------------------------------
 
-# India Standard Time. Falls back to a fixed +05:30 offset if the
-# tzdata package is missing on the host.
 try:
     _IST = ZoneInfo("Asia/Kolkata")
 except Exception:  # pragma: no cover — defensive
@@ -71,6 +95,23 @@ def _timestamp_fields() -> dict[str, Any]:
         "updated_at": _now_ist_string(),
         "updated_at_utc": _now_utc(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Size formatting
+# ---------------------------------------------------------------------------
+
+def _format_bytes(n: int | float | None) -> str:
+    """Human-readable size, e.g. ``4.6 MB``."""
+    if not isinstance(n, (int, float)) or n < 0:
+        return "—"
+    units = ["B", "KB", "MB", "GB"]
+    size = float(n)
+    i = 0
+    while size >= 1024 and i < len(units) - 1:
+        size /= 1024.0
+        i += 1
+    return f"{size:.1f} {units[i]}"
 
 
 # ---------------------------------------------------------------------------
@@ -107,18 +148,7 @@ def save_metadata(
     metadata: dict[str, Any],
     file_link: str | None,
 ) -> bool:
-    """Upsert the run metadata into the fixed metadata document.
-
-    Args:
-        metadata:  any JSON-serialisable dict — typically the same one
-                   that was written into the archive's
-                   ``_metadata.json`` plus archive info from the
-                   summary.
-        file_link: public MEGA link to the uploaded archive, or None.
-
-    Returns True on success, False when Mongo is disabled or the write
-    failed.
-    """
+    """Upsert the run metadata into the fixed metadata document."""
     client = _client()
     if client is None:
         return False
@@ -167,59 +197,159 @@ def save_metadata(
 # Blob
 # ---------------------------------------------------------------------------
 
+def _base_blob_doc(
+    archive_path: Path,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the metadata fields shared by every blob document variant."""
+    size = summary.get("archive_size_bytes")
+    if not isinstance(size, (int, float)):
+        try:
+            size = archive_path.stat().st_size
+        except Exception:
+            size = None
+
+    return {
+        "_id": settings.mongo_blob_doc_id,
+        "archive_name": summary.get("archive_name") or archive_path.name,
+        "archive_size_bytes": size,
+        "archive_size_human": _format_bytes(size),
+        "folder": summary.get("folder"),
+        "file_link": summary.get("file_link"),
+        "max_blob_mb": settings.mongo_max_blob_mb,
+    }
+
+
 def save_blob_if_small(
     archive_path: Path,
     summary: dict[str, Any],
 ) -> dict[str, Any]:
-    """Upsert the archive bytes into the fixed blob document.
+    """Upsert the blob document.
+
+    The document is **always** written. When the archive fits under
+    ``MONGO_MAX_BLOB_MB`` the binary is stored; when it does not, the
+    document carries the same metadata plus a ``note`` explaining the
+    skip and pointing at the MEGA share link.
 
     Returns a small status dict — always, never raises:
 
-        {"saved": True,  "size_bytes": 12345}
-        {"saved": False, "reason": "...", ...}
+        {"saved": True,  "size_bytes": 12345, "status": "saved"}
+        {"saved": False, "status": "skipped-size", "size_bytes": ...,
+         "limit_bytes": ..., "note": "..."}
+        {"saved": False, "status": "stat-failed" | "read-failed"
+                                | "mongo-error" | "mongo-disabled"}
     """
     client = _client()
     if client is None:
-        return {"saved": False, "reason": "mongo-disabled"}
+        return {"saved": False, "status": "mongo-disabled"}
 
+    # ---- Resolve the archive size -----------------------------------
     try:
         size = archive_path.stat().st_size
     except Exception:
         logger.exception("Unable to stat archive for Mongo blob save")
-        return {"saved": False, "reason": "stat-failed"}
+        return {"saved": False, "status": "stat-failed"}
 
     limit_bytes = settings.mongo_max_blob_mb * 1024 * 1024
-    if size > limit_bytes:
-        logger.info(
-            "Skipping Mongo blob save: archive %d bytes exceeds "
-            "MONGO_MAX_BLOB_MB=%d (%d bytes)",
-            size,
-            settings.mongo_max_blob_mb,
-            limit_bytes,
-        )
-        return {
-            "saved": False,
-            "reason": "too-large",
-            "size_bytes": size,
-            "limit_bytes": limit_bytes,
-        }
+    doc = _base_blob_doc(archive_path, summary)
+    doc.update(_timestamp_fields())
 
-    # Read the archive into memory. At ≤ 50 MB this is fine.
+    # ---- Branch on size ---------------------------------------------
+    if size > limit_bytes:
+        file_link = summary.get("file_link")
+
+        note_lines = [
+            f"Backup archive ({_format_bytes(size)}) exceeds the "
+            f"{settings.mongo_max_blob_mb} MB Mongo blob limit.",
+        ]
+        if file_link:
+            note_lines.append(
+                "Download it through the shared link in 'file_link'."
+            )
+        else:
+            note_lines.append(
+                "No share link was captured for this run — check the "
+                "MEGA backup folder directly."
+            )
+
+        doc.update(
+            {
+                "data": None,
+                "status": "skipped-size",
+                "reason": "size_limit_exceeded",
+                "limit_bytes": limit_bytes,
+                "limit_human": _format_bytes(limit_bytes),
+                "note": " ".join(note_lines),
+            }
+        )
+
+        try:
+            collection = client[settings.mongo_db_name][
+                settings.mongo_blob_collection
+            ]
+            collection.update_one(
+                {"_id": settings.mongo_blob_doc_id},
+                {"$set": doc},
+                upsert=True,
+            )
+            logger.warning(
+                "Mongo blob skipped (size %d bytes > %d bytes); "
+                "metadata-only doc upserted with share link. "
+                "db=%s collection=%s doc=%s",
+                size,
+                limit_bytes,
+                settings.mongo_db_name,
+                settings.mongo_blob_collection,
+                settings.mongo_blob_doc_id,
+            )
+            return {
+                "saved": False,
+                "status": "skipped-size",
+                "reason": "size_limit_exceeded",
+                "size_bytes": size,
+                "limit_bytes": limit_bytes,
+                "file_link": file_link,
+            }
+        except PyMongoError:
+            logger.exception(
+                "Mongo metadata-only blob upsert failed; db=%s "
+                "collection=%s doc=%s",
+                settings.mongo_db_name,
+                settings.mongo_blob_collection,
+                settings.mongo_blob_doc_id,
+            )
+            return {
+                "saved": False,
+                "status": "mongo-error",
+                "size_bytes": size,
+                "limit_bytes": limit_bytes,
+            }
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    # ---- Archive fits — read it and store the binary ----------------
     try:
         data = archive_path.read_bytes()
     except Exception:
         logger.exception("Unable to read archive for Mongo blob save")
-        return {"saved": False, "reason": "read-failed"}
+        return {"saved": False, "status": "read-failed"}
 
-    doc = {
-        "_id": settings.mongo_blob_doc_id,
-        "archive_name": summary.get("archive_name") or archive_path.name,
-        "archive_size_bytes": size,
-        "folder": summary.get("folder"),
-        "file_link": summary.get("file_link"),
-        "data": Binary(data),
-        **_timestamp_fields(),
-    }
+    doc.update(
+        {
+            "data": Binary(data),
+            "status": "saved",
+            "reason": None,
+            "limit_bytes": limit_bytes,
+            "limit_human": _format_bytes(limit_bytes),
+            "note": (
+                f"Backup archive stored inline ({_format_bytes(size)}). "
+                "The same archive is also available via 'file_link'."
+            ),
+        }
+    )
 
     try:
         collection = client[settings.mongo_db_name][
@@ -239,7 +369,7 @@ def save_blob_if_small(
             size,
             doc["updated_at"],
         )
-        return {"saved": True, "size_bytes": size}
+        return {"saved": True, "status": "saved", "size_bytes": size}
     except PyMongoError as exc:
         message = str(exc)
         if "too large" in message.lower() or "10334" in message:
@@ -256,7 +386,12 @@ def save_blob_if_small(
                 settings.mongo_blob_collection,
                 settings.mongo_blob_doc_id,
             )
-        return {"saved": False, "reason": "mongo-error", "error": message}
+        return {
+            "saved": False,
+            "status": "mongo-error",
+            "size_bytes": size,
+            "error": message,
+        }
     finally:
         try:
             client.close()
