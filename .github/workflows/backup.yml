@@ -1,6 +1,12 @@
 name: Backup candles to MEGA
 
 on:
+  # Run on every push to the default branches. Adjust the branch list
+  # if you push to other long-lived branches (e.g. "develop").
+  push:
+    branches:
+      - main
+
   schedule:
     # 05:00 IST (Asia/Kolkata) Monday–Saturday.
     # GitHub Actions cron is UTC; IST = UTC+05:30, so
@@ -44,11 +50,11 @@ jobs:
 
       - name: Write .env
         env:
-          # SUBSCRIPTIONS_API_URL is stored as a secret in this repo.
           SUBSCRIPTIONS_API_URL: ${{ secrets.SUBSCRIPTIONS_API_URL }}
           MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
-          # Optional repository variable; falls back to the default.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MEGA_BACKUP_FOLDER_OVERRIDE: ${{ vars.MEGA_BACKUP_FOLDER }}
         run: |
           : "${SUBSCRIPTIONS_API_URL:?SUBSCRIPTIONS_API_URL secret is required}"
@@ -57,6 +63,14 @@ jobs:
 
           MEGA_BACKUP_FOLDER="${MEGA_BACKUP_FOLDER_OVERRIDE:-novag7_candles_backup}"
           : "${MEGA_BACKUP_FOLDER:?MEGA_BACKUP_FOLDER resolved to empty}"
+
+          # Telegram is optional. When both secrets are present, enable
+          # it; otherwise leave it off so the tool runs normally.
+          if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+            TELEGRAM_ENABLED=true
+          else
+            TELEGRAM_ENABLED=false
+          fi
 
           cat > .env <<EOF
           SUBSCRIPTIONS_API_URL=${SUBSCRIPTIONS_API_URL}
@@ -73,11 +87,16 @@ jobs:
           MEGA_EMAIL=${MEGA_EMAIL}
           MEGA_PASSWORD=${MEGA_PASSWORD}
           MEGA_BACKUP_FOLDER=${MEGA_BACKUP_FOLDER}
+          TELEGRAM_ENABLED=${TELEGRAM_ENABLED}
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+          TELEGRAM_TIMEOUT_SECONDS=10
           EOF
 
           echo "Wrote .env"
           echo "SUBSCRIPTIONS_API_URL set (length ${#SUBSCRIPTIONS_API_URL})"
           echo "MEGA_BACKUP_FOLDER=${MEGA_BACKUP_FOLDER}"
+          echo "TELEGRAM_ENABLED=${TELEGRAM_ENABLED}"
 
       - name: Fetch candles and upload to MEGA
         run: python -m candle_backup
