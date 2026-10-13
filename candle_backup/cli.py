@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+from candle_backup.config import settings
 from candle_backup.historical_candle_store import historical_candle_store
 from candle_backup.logger import get_logger
 from candle_backup.mega_backup_service import backup_to_mega
@@ -12,6 +13,10 @@ from candle_backup.subscription_store import subscription_store
 from candle_backup.telegram_service import telegram_service
 
 logger = get_logger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def _do_fetch() -> tuple[int, dict]:
@@ -48,11 +53,11 @@ async def _do_fetch() -> tuple[int, dict]:
     }
 
 
-def _do_backup() -> tuple[int, dict]:
+def _do_backup(metadata: dict) -> tuple[int, dict]:
     """Run the MEGA upload. Returns (exit_code, summary_dict)."""
     logger.info("Backup: zipping data/ and uploading to MEGA")
     try:
-        summary = backup_to_mega()
+        summary = backup_to_mega(metadata=metadata)
     except Exception as exc:
         logger.exception("Backup failed")
         return 1, {"stage": "backup", "error": str(exc)}
@@ -73,8 +78,74 @@ def _format_bytes(n: int | None) -> str:
     return f"{size:.1f} {units[i]}"
 
 
+def _build_metadata(
+    run_started_at: str,
+    fetch_summary: dict | None,
+    backup_summary: dict | None,
+    do_fetch: bool,
+    do_backup: bool,
+) -> dict:
+    """Assemble the structured metadata written into data.zip.
+
+    Keys are grouped by concern so consumers can navigate the JSON
+    easily:
+
+        run.*       — timestamps, duration, phases executed
+        market.*    — timezone and window used by the intraday fetch
+        fetch.*     — instruments count + per-job summaries
+        backup.*    — remote folder and archive stats
+    """
+    run_completed_at = _now_iso()
+    duration = None
+    try:
+        started = datetime.fromisoformat(run_started_at)
+        completed = datetime.fromisoformat(run_completed_at)
+        duration = round((completed - started).total_seconds(), 3)
+    except Exception:
+        duration = None
+
+    metadata: dict = {
+        "project": "candle-backup",
+        "run": {
+            "started_at": run_started_at,
+            "completed_at": run_completed_at,
+            "duration_seconds": duration,
+            "fetch_phase": "enabled" if do_fetch else "disabled",
+            "backup_phase": "enabled" if do_backup else "disabled",
+        },
+        "market": {
+            "timezone": settings.market_timezone,
+            "open_time": settings.market_open_time,
+            "close_time": settings.market_close_time,
+            "intraday_test_mode": settings.intraday_test_mode,
+        },
+    }
+
+    if fetch_summary:
+        metadata["fetch"] = {
+            "instruments_total": fetch_summary.get("instruments"),
+            "historical": fetch_summary.get("historical"),
+            "intraday": fetch_summary.get("intraday"),
+        }
+    else:
+        metadata["fetch"] = None
+
+    if backup_summary:
+        metadata["backup"] = {
+            "folder": backup_summary.get("folder"),
+            "archive_name": backup_summary.get("archive_name"),
+            "archive_size_bytes": backup_summary.get("archive_size_bytes"),
+            "source_file_count": backup_summary.get("source_file_count"),
+            "uploaded": backup_summary.get("uploaded"),
+        }
+    else:
+        metadata["backup"] = None
+
+    return metadata
+
+
 async def run(do_fetch: bool, do_backup: bool) -> int:
-    started_at = datetime.now(timezone.utc)
+    run_started_at = _now_iso()
 
     # ---- Telegram: start ------------------------------------------------
     try:
@@ -83,7 +154,7 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
                 "project": "candle-backup",
                 "fetch": "enabled" if do_fetch else "disabled",
                 "backup": "enabled" if do_backup else "disabled",
-                "started_at": started_at.isoformat(),
+                "started_at": run_started_at,
             }
         )
     except Exception:
@@ -91,6 +162,8 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
 
     exit_code = 0
     failure_error: str | None = None
+    fetch_summary: dict | None = None
+    backup_summary: dict | None = None
 
     # ---- Run ------------------------------------------------------------
     try:
@@ -105,7 +178,16 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
                 raise RuntimeError(failure_error)
 
         if do_backup:
-            rc, backup_summary = await asyncio.to_thread(_do_backup)
+            # Build the metadata *before* the upload so the zip carries
+            # the same information the summary reports.
+            metadata = _build_metadata(
+                run_started_at=run_started_at,
+                fetch_summary=fetch_summary,
+                backup_summary=None,
+                do_fetch=do_fetch,
+                do_backup=do_backup,
+            )
+            rc, backup_summary = await asyncio.to_thread(_do_backup, metadata)
             if rc != 0:
                 exit_code = rc
                 failure_error = (
@@ -121,14 +203,15 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
             failure_error = f"{type(exc).__name__}: {exc}"
             logger.exception("Unhandled exception during run")
 
-        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        elapsed = (datetime.now(timezone.utc) -
+                   datetime.fromisoformat(run_started_at)).total_seconds()
         try:
             telegram_service.notify_failure(
                 failure_error,
                 {
                     "project": "candle-backup",
                     "elapsed_seconds": f"{elapsed:.1f}",
-                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "failed_at": _now_iso(),
                 },
             )
         except Exception:
@@ -137,27 +220,22 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
         return exit_code or 1
 
     # ---- Telegram: success ----------------------------------------------
-    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+    elapsed = (datetime.now(timezone.utc) -
+               datetime.fromisoformat(run_started_at)).total_seconds()
 
     details: dict[str, object] = {
         "project": "candle-backup",
         "elapsed_seconds": f"{elapsed:.1f}",
-        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": _now_iso(),
     }
 
-    if do_backup:
-        # Attach the archive info produced by the backup step.
-        try:
-            details["archive"] = backup_summary.get("archive_name")  # type: ignore[name-defined]
-            details["archive_size"] = _format_bytes(
-                backup_summary.get("archive_size_bytes")  # type: ignore[name-defined]
-            )
-            details["source_files"] = backup_summary.get(  # type: ignore[name-defined]
-                "source_file_count"
-            )
-            details["folder"] = backup_summary.get("folder")  # type: ignore[name-defined]
-        except NameError:
-            pass
+    if backup_summary:
+        details["archive"] = backup_summary.get("archive_name")
+        details["archive_size"] = _format_bytes(
+            backup_summary.get("archive_size_bytes")
+        )
+        details["source_files"] = backup_summary.get("source_file_count")
+        details["folder"] = backup_summary.get("folder")
 
     try:
         telegram_service.notify_success(details)

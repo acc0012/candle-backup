@@ -9,12 +9,13 @@ Design
   makes the backup trivially downloadable for consumers.
 * The zip contains the **contents** of ``data/`` directly at its root —
   ``index/``, ``nifty/``, ``sensex/``, etc. — not a wrapping ``data/``
-  folder. Downloading and unzipping gives the same layout as the local
-  ``data/`` directory.
+  folder.
+* Two provenance files are written into the archive before upload:
+    - ``_manifest.txt``  — human-readable summary.
+    - ``_metadata.json`` — structured run metadata (timestamps, fetch
+      counters, market window, archive info) for programmatic consumers.
 * The remote folder is delete-then-recreate on every call so a stale
   archive never lingers next to the fresh one.
-* A small ``_manifest.txt`` is written **inside** the zip before upload
-  so the archive is self-describing.
 * The zip is created in a temporary directory that is removed as soon
   as the upload finishes, so nothing is left on disk.
 * Returns a summary dict so the caller can log or exit accordingly.
@@ -22,6 +23,7 @@ Design
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import zipfile
@@ -84,7 +86,26 @@ def _count_files(root: Path) -> int:
     return sum(1 for p in root.rglob("*") if p.is_file())
 
 
-def _build_archive(data_dir: Path, temp_dir: Path) -> Path:
+def _write_manifest(
+    data_dir: Path,
+    file_count: int,
+    metadata: dict[str, Any],
+) -> str:
+    """Return the text content of ``_manifest.txt``."""
+    return (
+        "project=candle-backup\n"
+        f"run_started_at={metadata.get('run_started_at', '')}\n"
+        f"run_completed_at={metadata.get('run_completed_at', '')}\n"
+        f"data_dir={data_dir.name}\n"
+        f"file_count={file_count}\n"
+    )
+
+
+def _build_archive(
+    data_dir: Path,
+    temp_dir: Path,
+    metadata: dict[str, Any],
+) -> Path:
     """Zip the *contents* of ``data_dir`` into ``temp_dir/data.zip``.
 
     The archive is always named ``data.zip`` and contains the entries
@@ -94,10 +115,8 @@ def _build_archive(data_dir: Path, temp_dir: Path) -> Path:
         ├── index/
         ├── nifty/
         ├── sensex/
-        └── _manifest.txt
-
-    A ``_manifest.txt`` entry is appended at the top level with the
-    upload time, source directory name, and file count.
+        ├── _manifest.txt
+        └── _metadata.json
     """
     archive_base = temp_dir / "data"
 
@@ -114,16 +133,20 @@ def _build_archive(data_dir: Path, temp_dir: Path) -> Path:
         )
     )
 
-    manifest = (
-        "project=candle-backup\n"
-        f"uploaded_at={datetime.now(timezone.utc).isoformat()}\n"
-        f"data_dir={data_dir.name}\n"
-        f"file_count={_count_files(data_dir)}\n"
-    )
+    file_count = _count_files(data_dir)
+
+    manifest_text = _write_manifest(data_dir, file_count, metadata)
+    metadata_text = json.dumps(metadata, indent=2, ensure_ascii=False)
+
     with zipfile.ZipFile(archive_path, "a", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("_manifest.txt", manifest)
+        zf.writestr("_manifest.txt", manifest_text)
+        zf.writestr("_metadata.json", metadata_text)
 
     return archive_path
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +156,18 @@ def _build_archive(data_dir: Path, temp_dir: Path) -> Path:
 def backup_to_mega(
     folder: str | None = None,
     data_dir: Path | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Zip ``data_dir`` into ``data.zip`` and upload it to MEGA.
+
+    Args:
+        folder:    remote folder name (defaults to settings).
+        data_dir:  local source (defaults to ``settings.data_dir``).
+        metadata:  optional run metadata. Whatever is passed is merged
+                   with the archive info (name, size, file count) and
+                   written into the zip as ``_metadata.json``. The same
+                   structure appears in the returned summary so callers
+                   can log it and forward it to other systems.
 
     The remote folder is deleted and recreated before the upload so a
     stale archive from a previous run never lingers alongside the new
@@ -150,11 +183,21 @@ def backup_to_mega(
     if file_count == 0:
         raise RuntimeError(f"Data dir is empty: {data_dir}")
 
+    # Seed the metadata with archive info that only becomes known here.
+    # Caller-supplied keys are preserved; we do not silently overwrite
+    # anything the caller already set unless it is an archive field.
+    archive_info: dict[str, Any] = {
+        "project": "candle-backup",
+        "archive_name": "data.zip",
+        "archive_source_file_count": file_count,
+    }
+    metadata = {**(metadata or {}), **archive_info}
+
     # Everything below happens inside a temporary directory that is
     # removed as soon as the ``with`` block exits — the .zip never
     # leaks into the repository.
     with tempfile.TemporaryDirectory(prefix="candle_backup_") as tmp:
-        archive_path = _build_archive(data_dir, Path(tmp))
+        archive_path = _build_archive(data_dir, Path(tmp), metadata)
         archive_name = archive_path.name          # always "data.zip"
         archive_size = archive_path.stat().st_size
 
@@ -197,7 +240,7 @@ def backup_to_mega(
         "source_file_count": file_count,
         "uploaded": uploaded,
         "upload_error": upload_error,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": _now_iso(),
     }
     logger.info("Backup summary: %s", summary)
     return summary
