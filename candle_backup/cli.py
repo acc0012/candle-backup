@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 from candle_backup.config import settings
 from candle_backup.historical_candle_store import historical_candle_store
 from candle_backup.logger import get_logger
 from candle_backup.mega_backup_service import backup_to_mega
+from candle_backup.mongo_service import save_blob_if_small, save_metadata
 from candle_backup.subscription_store import subscription_store
 from candle_backup.telegram_service import telegram_service
 
@@ -18,6 +20,10 @@ logger = get_logger(__name__)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+# ---------------------------------------------------------------------------
+# Fetch phase
+# ---------------------------------------------------------------------------
 
 async def _do_fetch() -> tuple[int, dict]:
     """Run fetch jobs. Returns (exit_code, summary_dict)."""
@@ -53,11 +59,32 @@ async def _do_fetch() -> tuple[int, dict]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Backup phase
+# ---------------------------------------------------------------------------
+
 def _do_backup(metadata: dict) -> tuple[int, dict]:
-    """Run the MEGA upload. Returns (exit_code, summary_dict)."""
+    """Run the MEGA upload. Returns (exit_code, summary_dict).
+
+    A post-upload hook persists the run metadata and (when small
+    enough) the archive bytes to MongoDB. The hook runs while the
+    archive still exists in the temp directory.
+    """
+
+    def _hook(archive_path: Path, summary: dict) -> None:
+        # Merge the caller-supplied metadata with the archive summary
+        # so the Mongo document carries everything in one place.
+        merged = {**metadata, **summary}
+        save_metadata(merged, summary.get("file_link"))
+        blob_result = save_blob_if_small(archive_path, summary)
+        summary["mongo_blob"] = blob_result
+
     logger.info("Backup: zipping data/ and uploading to MEGA")
     try:
-        summary = backup_to_mega(metadata=metadata)
+        summary = backup_to_mega(
+            metadata=metadata,
+            post_upload=_hook,
+        )
     except Exception as exc:
         logger.exception("Backup failed")
         return 1, {"stage": "backup", "error": str(exc)}
@@ -65,6 +92,10 @@ def _do_backup(metadata: dict) -> tuple[int, dict]:
     logger.info("Backup: done %s", summary)
     return (0 if summary.get("uploaded") else 1), summary
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _format_bytes(n: int | None) -> str:
     if not isinstance(n, int):
@@ -85,16 +116,7 @@ def _build_metadata(
     do_fetch: bool,
     do_backup: bool,
 ) -> dict:
-    """Assemble the structured metadata written into data.zip.
-
-    Keys are grouped by concern so consumers can navigate the JSON
-    easily:
-
-        run.*       — timestamps, duration, phases executed
-        market.*    — timezone and window used by the intraday fetch
-        fetch.*     — instruments count + per-job summaries
-        backup.*    — remote folder and archive stats
-    """
+    """Assemble the structured metadata written into data.zip and Mongo."""
     run_completed_at = _now_iso()
     duration = None
     try:
@@ -119,6 +141,9 @@ def _build_metadata(
             "close_time": settings.market_close_time,
             "intraday_test_mode": settings.intraday_test_mode,
         },
+        # Mirrors the top-level _manifest.txt fields.
+        "run_started_at": run_started_at,
+        "run_completed_at": run_completed_at,
     }
 
     if fetch_summary:
@@ -137,12 +162,17 @@ def _build_metadata(
             "archive_size_bytes": backup_summary.get("archive_size_bytes"),
             "source_file_count": backup_summary.get("source_file_count"),
             "uploaded": backup_summary.get("uploaded"),
+            "file_link": backup_summary.get("file_link"),
         }
     else:
         metadata["backup"] = None
 
     return metadata
 
+
+# ---------------------------------------------------------------------------
+# Top-level
+# ---------------------------------------------------------------------------
 
 async def run(do_fetch: bool, do_backup: bool) -> int:
     run_started_at = _now_iso()
@@ -178,8 +208,6 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
                 raise RuntimeError(failure_error)
 
         if do_backup:
-            # Build the metadata *before* the upload so the zip carries
-            # the same information the summary reports.
             metadata = _build_metadata(
                 run_started_at=run_started_at,
                 fetch_summary=fetch_summary,
@@ -197,8 +225,6 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
                 raise RuntimeError(failure_error)
 
     except Exception as exc:
-        # Already logged above by the inner step; this catches anything
-        # that escaped and sends the Telegram failure notification.
         if failure_error is None:
             failure_error = f"{type(exc).__name__}: {exc}"
             logger.exception("Unhandled exception during run")
@@ -236,6 +262,12 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
         )
         details["source_files"] = backup_summary.get("source_file_count")
         details["folder"] = backup_summary.get("folder")
+
+        mongo_blob = backup_summary.get("mongo_blob") or {}
+        if mongo_blob.get("saved"):
+            details["mongo_blob"] = f"saved ({_format_bytes(mongo_blob.get('size_bytes'))})"
+        elif mongo_blob:
+            details["mongo_blob"] = mongo_blob.get("reason", "skipped")
 
     try:
         telegram_service.notify_success(details)

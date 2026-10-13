@@ -5,19 +5,19 @@ Uses the vendored ``mega_local`` package — no external MEGA SDK.
 Design
 ------
 * The entire ``data/`` directory is compressed into a single ``data.zip``
-  file and uploaded as one object. This keeps the remote folder tidy and
-  makes the backup trivially downloadable for consumers.
+  file and uploaded as one object.
 * The zip contains the **contents** of ``data/`` directly at its root —
   ``index/``, ``nifty/``, ``sensex/``, etc. — not a wrapping ``data/``
   folder.
 * Two provenance files are written into the archive before upload:
     - ``_manifest.txt``  — human-readable summary.
-    - ``_metadata.json`` — structured run metadata (timestamps, fetch
-      counters, market window, archive info) for programmatic consumers.
+    - ``_metadata.json`` — structured run metadata.
 * The remote folder is delete-then-recreate on every call so a stale
   archive never lingers next to the fresh one.
 * The zip is created in a temporary directory that is removed as soon
-  as the upload finishes, so nothing is left on disk.
+  as the upload finishes. An optional ``post_upload`` callback is
+  invoked while the archive still exists, so callers can persist the
+  bytes (e.g. to MongoDB) before cleanup.
 * Returns a summary dict so the caller can log or exit accordingly.
 """
 
@@ -29,7 +29,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mega_local import Mega
 
@@ -37,6 +37,12 @@ from candle_backup.config import settings
 from candle_backup.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# A hook invoked after a successful upload but before the temp archive
+# is deleted. Receives (archive_path, summary) — the path is valid for
+# the duration of the call only.
+PostUploadHook = Callable[[Path, dict[str, Any]], None]
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +128,6 @@ def _build_archive(
 
     logger.info("Creating zip archive from %s", data_dir)
 
-    # root_dir=data_dir, base_dir defaults to '.' which is interpreted
-    # relative to root_dir — so the archive contains the *contents* of
-    # data_dir, not a wrapping 'data' folder.
     archive_path = Path(
         shutil.make_archive(
             base_name=str(archive_base),
@@ -145,6 +148,34 @@ def _build_archive(
     return archive_path
 
 
+def _get_uploaded_file_link(
+    mega: Mega,
+    folder_id: str,
+    archive_name: str,
+) -> str | None:
+    """Return the public MEGA link of the just-uploaded archive.
+
+    Best-effort: any failure is logged and None is returned.
+    """
+    try:
+        files = mega.get_files()
+    except Exception:
+        logger.exception("Unable to refresh file list to obtain link")
+        return None
+
+    for handle, node in files.items():
+        if node.get("p") != folder_id:
+            continue
+        if (node.get("a") or {}).get("n") != archive_name:
+            continue
+        try:
+            return mega.get_link((handle, node))
+        except Exception:
+            logger.exception("mega.get_link failed for %s", archive_name)
+            return None
+    return None
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -157,17 +188,20 @@ def backup_to_mega(
     folder: str | None = None,
     data_dir: Path | None = None,
     metadata: dict[str, Any] | None = None,
+    post_upload: PostUploadHook | None = None,
 ) -> dict[str, Any]:
     """Zip ``data_dir`` into ``data.zip`` and upload it to MEGA.
 
     Args:
-        folder:    remote folder name (defaults to settings).
-        data_dir:  local source (defaults to ``settings.data_dir``).
-        metadata:  optional run metadata. Whatever is passed is merged
-                   with the archive info (name, size, file count) and
-                   written into the zip as ``_metadata.json``. The same
-                   structure appears in the returned summary so callers
-                   can log it and forward it to other systems.
+        folder:       remote folder name (defaults to settings).
+        data_dir:     local source (defaults to ``settings.data_dir``).
+        metadata:     optional run metadata. Merged with archive info
+                      and written into the zip as ``_metadata.json``.
+        post_upload:  optional callback invoked after a successful
+                      upload but before the temp archive is deleted.
+                      Receives ``(archive_path, summary)``. Any exception
+                      it raises is logged and does not affect the
+                      returned summary.
 
     The remote folder is deleted and recreated before the upload so a
     stale archive from a previous run never lingers alongside the new
@@ -183,9 +217,7 @@ def backup_to_mega(
     if file_count == 0:
         raise RuntimeError(f"Data dir is empty: {data_dir}")
 
-    # Seed the metadata with archive info that only becomes known here.
-    # Caller-supplied keys are preserved; we do not silently overwrite
-    # anything the caller already set unless it is an archive field.
+    # Seed metadata with fields only known here.
     archive_info: dict[str, Any] = {
         "project": "candle-backup",
         "archive_name": "data.zip",
@@ -193,13 +225,23 @@ def backup_to_mega(
     }
     metadata = {**(metadata or {}), **archive_info}
 
-    # Everything below happens inside a temporary directory that is
-    # removed as soon as the ``with`` block exits — the .zip never
-    # leaks into the repository.
+    summary: dict[str, Any] = {
+        "folder": folder,
+        "data_dir": str(data_dir),
+        "archive_name": "data.zip",
+        "archive_size_bytes": None,
+        "source_file_count": file_count,
+        "uploaded": False,
+        "upload_error": None,
+        "file_link": None,
+        "completed_at": None,
+    }
+
     with tempfile.TemporaryDirectory(prefix="candle_backup_") as tmp:
         archive_path = _build_archive(data_dir, Path(tmp), metadata)
-        archive_name = archive_path.name          # always "data.zip"
+        archive_name = archive_path.name
         archive_size = archive_path.stat().st_size
+        summary["archive_size_bytes"] = archive_size
 
         logger.info(
             "Archive ready: %s (files=%d size=%d bytes)",
@@ -219,28 +261,34 @@ def backup_to_mega(
         new_id = mega.create_folder_at(folder, root_id)
         logger.info("Created fresh remote folder %r id=%s", folder, new_id)
 
-        uploaded = False
-        upload_error: str | None = None
         try:
             mega.upload(
                 str(archive_path),
                 dest=new_id,
                 dest_filename=archive_name,
             )
-            uploaded = True
+            summary["uploaded"] = True
         except Exception as exc:
-            upload_error = f"{type(exc).__name__}: {exc}"
+            summary["upload_error"] = f"{type(exc).__name__}: {exc}"
             logger.exception("Upload failed: %s", archive_name)
 
-    summary = {
-        "folder": folder,
-        "data_dir": str(data_dir),
-        "archive_name": archive_name,
-        "archive_size_bytes": archive_size,
-        "source_file_count": file_count,
-        "uploaded": uploaded,
-        "upload_error": upload_error,
-        "completed_at": _now_iso(),
-    }
+        if summary["uploaded"]:
+            summary["file_link"] = _get_uploaded_file_link(
+                mega, new_id, archive_name
+            )
+            if summary["file_link"]:
+                logger.info("MEGA public link: %s", summary["file_link"])
+            else:
+                logger.warning(
+                    "Uploaded but could not obtain a public MEGA link"
+                )
+
+            if post_upload is not None:
+                try:
+                    post_upload(archive_path, summary)
+                except Exception:
+                    logger.exception("post_upload callback failed")
+
+    summary["completed_at"] = _now_iso()
     logger.info("Backup summary: %s", summary)
     return summary

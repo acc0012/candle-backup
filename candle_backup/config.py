@@ -56,11 +56,6 @@ class Settings:
     market_close_time: str = os.getenv("MARKET_CLOSE_TIME", "15:40")
 
     # Intraday test mode.
-    #   true  -> the intraday candle fetch runs even outside the market
-    #            window. Intended for manual verification and for CI runs
-    #            that happen before the market opens.
-    #   false -> the intraday step is skipped outside the market window
-    #            (default).
     intraday_test_mode: bool = _env_bool("INTRADAY_TEST_MODE", False)
 
     # MEGA backup.
@@ -78,6 +73,48 @@ class Settings:
     telegram_timeout_seconds: int = int(
         os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10")
     )
+
+    # ------------------------------------------------------------------
+    # MongoDB (optional)
+    # ------------------------------------------------------------------
+    # When enabled, the run metadata is upserted into a fixed document
+    # inside MONGO_METADATA_COLLECTION, and — if the archive is small
+    # enough — the archive bytes are upserted into a fixed document
+    # inside MONGO_BLOB_COLLECTION. Both use fixed _id values so no new
+    # documents are ever created across runs.
+    mongo_enabled: bool = _env_bool("MONGO_ENABLED", False)
+
+    # Full connection string, e.g.
+    #   mongodb+srv://user:pass@cluster.example.net/?retryWrites=true
+    mongo_url: str = _env_str("MONGO_URL", "")
+
+    # Database and collection that hold the metadata document.
+    mongo_db_name: str = _env_str("MONGO_DB_NAME", "UPSTOX_APP_V2")
+    mongo_metadata_collection: str = _env_str(
+        "MONGO_METADATA_COLLECTION", "app_tokens"
+    )
+    mongo_metadata_doc_id: str = _env_str(
+        "MONGO_METADATA_DOC_ID", "backup_candles"
+    )
+
+    # Collection and doc that hold the archive bytes.
+    mongo_blob_collection: str = _env_str(
+        "MONGO_BLOB_COLLECTION", "backup_collection"
+    )
+    mongo_blob_doc_id: str = _env_str(
+        "MONGO_BLOB_DOC_ID", "backup_historical_candles"
+    )
+
+    # Skip the blob save if the archive exceeds this size in MB.
+    #
+    # NOTE: MongoDB's hard BSON document limit is 16 MB. Setting this
+    # above 16 is allowed but the write will be rejected by the server
+    # for archives larger than ~15 MB. The error is caught and logged;
+    # the run itself is not aborted.
+    mongo_max_blob_mb: int = int(os.getenv("MONGO_MAX_BLOB_MB", "50"))
+
+    # Server-selection / connect timeout for MongoClient, in ms.
+    mongo_timeout_ms: int = int(os.getenv("MONGO_TIMEOUT_MS", "10000"))
 
 
 settings = Settings()
