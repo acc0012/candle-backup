@@ -1,0 +1,5 @@
+python-dotenv
+requests
+upstox-python-sdk
+tzdata
+pycryptodome
