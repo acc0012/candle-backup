@@ -63,5 +63,13 @@ class Settings:
         "MEGA_BACKUP_FOLDER", "novag7_candles_backup"
     )
 
+    # Telegram notifications (optional, best-effort).
+    telegram_enabled: bool = _env_bool("TELEGRAM_ENABLED", False)
+    telegram_bot_token: str = _env_str("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = _env_str("TELEGRAM_CHAT_ID", "")
+    telegram_timeout_seconds: int = int(
+        os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10")
+    )
+
 
 settings = Settings()

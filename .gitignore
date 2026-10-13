@@ -41,7 +41,7 @@ htmlcov/
 *.pem
 *.key
 credentials.json
-
+workflow.txt
 # Python
 __pycache__/
 *.py[codz]
@@ -53,7 +53,7 @@ myenv/
 build/
 dist/
 files.txt
-
+combined_output.txt
 # Runtime output
 logs*/
 data/
