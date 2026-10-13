@@ -1,0 +1,100 @@
+name: Backup candles to MEGA
+
+on:
+  schedule:
+    # 05:00 IST (Asia/Kolkata) Monday–Saturday.
+    # GitHub Actions cron is UTC; IST = UTC+05:30, so
+    #   05:00 IST  ==  23:30 UTC the previous calendar day.
+    # Sun 23:30 UTC -> Mon 05:00 IST, ..., Fri 23:30 UTC -> Sat 05:00 IST.
+    - cron: "30 23 * * 0-5"
+
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Optional note for manual runs"
+        required: false
+        default: "manual"
+
+concurrency:
+  # Never run two backups at once: they would fight over the same
+  # remote folder.
+  group: candle-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    name: Fetch candles and back up to MEGA
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write .env
+        env:
+          # SUBSCRIPTIONS_API_URL is stored as a secret in this repo.
+          SUBSCRIPTIONS_API_URL: ${{ secrets.SUBSCRIPTIONS_API_URL }}
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+          # Optional repository variable; falls back to the default.
+          MEGA_BACKUP_FOLDER_OVERRIDE: ${{ vars.MEGA_BACKUP_FOLDER }}
+        run: |
+          : "${SUBSCRIPTIONS_API_URL:?SUBSCRIPTIONS_API_URL secret is required}"
+          : "${MEGA_EMAIL:?MEGA_EMAIL secret is required}"
+          : "${MEGA_PASSWORD:?MEGA_PASSWORD secret is required}"
+
+          MEGA_BACKUP_FOLDER="${MEGA_BACKUP_FOLDER_OVERRIDE:-novag7_candles_backup}"
+          : "${MEGA_BACKUP_FOLDER:?MEGA_BACKUP_FOLDER resolved to empty}"
+
+          cat > .env <<EOF
+          SUBSCRIPTIONS_API_URL=${SUBSCRIPTIONS_API_URL}
+          REQUEST_TIMEOUT_SECONDS=30
+          LOG_LEVEL=INFO
+          LOG_FILE=logs/backup.log
+          DATA_DIR=data
+          HISTORY_LOOKBACK_DAYS=10
+          HISTORY_MAX_CONCURRENCY=8
+          MARKET_TIMEZONE=Asia/Kolkata
+          MARKET_OPEN_TIME=09:15
+          MARKET_CLOSE_TIME=15:40
+          MEGA_ENABLED=true
+          MEGA_EMAIL=${MEGA_EMAIL}
+          MEGA_PASSWORD=${MEGA_PASSWORD}
+          MEGA_BACKUP_FOLDER=${MEGA_BACKUP_FOLDER}
+          EOF
+
+          echo "Wrote .env"
+          echo "SUBSCRIPTIONS_API_URL set (length ${#SUBSCRIPTIONS_API_URL})"
+          echo "MEGA_BACKUP_FOLDER=${MEGA_BACKUP_FOLDER}"
+
+      - name: Fetch candles and upload to MEGA
+        run: python -m candle_backup
+
+      - name: Show data summary
+        if: always()
+        run: |
+          echo "Data directory size:"
+          du -sh data/ || true
+          echo "File count:"
+          find data/ -type f | wc -l || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
