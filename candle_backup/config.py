@@ -50,22 +50,36 @@ class Settings:
         os.getenv("HISTORY_MAX_CONCURRENCY", "8")
     )
 
+    # ------------------------------------------------------------------
+    # Historical completeness
+    # ------------------------------------------------------------------
+    # When true (default), the historical job never trusts the freshness
+    # check alone. Every run re-fetches the full lookback window so the
+    # backup uploaded to MEGA/Mongo always contains every market day,
+    # with no internal gaps.
+    #
+    # When false, the job uses the incremental skip: if the local file
+    # already contains data through the previous trading day, it is
+    # skipped. That is faster but can miss days that were never fetched.
+    #
+    # Default: true. This is a backup job, not a latency-sensitive one —
+    # the priority is completeness over speed.
+    history_strict_completeness: bool = _env_bool(
+        "HISTORY_STRICT_COMPLETENESS", True
+    )
+
+    # When strict completeness is on, each run re-fetches this many extra
+    # days *before* the configured lookback window. Upstox occasionally
+    # back-fills the most recent trading day after midnight, and the
+    # overlap guard catches that. Set to 0 to disable overlap.
+    history_verify_overlap_days: int = int(
+        os.getenv("HISTORY_VERIFY_OVERLAP_DAYS", "1")
+    )
+
     # Market window.
     market_timezone: str = os.getenv("MARKET_TIMEZONE", "Asia/Kolkata")
     market_open_time: str = os.getenv("MARKET_OPEN_TIME", "09:15")
     market_close_time: str = os.getenv("MARKET_CLOSE_TIME", "15:40")
-
-    # Expiry cutoff.
-    # An instrument is considered "expired" once the current time (in
-    # MARKET_TIMEZONE) has passed this time on the instrument's
-    # ``expiry`` date. Expired instruments are not fetched — an empty
-    # candles file with an "expired" marker is written instead.
-    #
-    # Instruments without an ``expiry`` field — index rows like
-    # "NSE_INDEX|Nifty 50" — are never treated as expired.
-    #
-    # Default: 16:00 IST (4pm on the expiry day).
-    expiry_cutoff_time: str = os.getenv("EXPIRY_CUTOFF_TIME", "16:00")
 
     # Intraday test mode.
     intraday_test_mode: bool = _env_bool("INTRADAY_TEST_MODE", False)
@@ -86,21 +100,9 @@ class Settings:
         os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10")
     )
 
-    # ------------------------------------------------------------------
-    # MongoDB (optional)
-    # ------------------------------------------------------------------
-    # When enabled, the run metadata is upserted into a fixed document
-    # inside MONGO_METADATA_COLLECTION, and — if the archive is small
-    # enough — the archive bytes are upserted into a fixed document
-    # inside MONGO_BLOB_COLLECTION. Both use fixed _id values so no new
-    # documents are ever created across runs.
+    # MongoDB (optional).
     mongo_enabled: bool = _env_bool("MONGO_ENABLED", False)
-
-    # Full connection string, e.g.
-    #   mongodb+srv://user:pass@cluster.example.net/?retryWrites=true
     mongo_url: str = _env_str("MONGO_URL", "")
-
-    # Database and collection that hold the metadata document.
     mongo_db_name: str = _env_str("MONGO_DB_NAME", "UPSTOX_APP_V2")
     mongo_metadata_collection: str = _env_str(
         "MONGO_METADATA_COLLECTION", "app_tokens"
@@ -108,24 +110,13 @@ class Settings:
     mongo_metadata_doc_id: str = _env_str(
         "MONGO_METADATA_DOC_ID", "backup_candles"
     )
-
-    # Collection and doc that hold the archive bytes.
     mongo_blob_collection: str = _env_str(
         "MONGO_BLOB_COLLECTION", "backup_collection"
     )
     mongo_blob_doc_id: str = _env_str(
         "MONGO_BLOB_DOC_ID", "backup_historical_candles"
     )
-
-    # Skip the blob save if the archive exceeds this size in MB.
-    #
-    # NOTE: MongoDB's hard BSON document limit is 16 MB. Setting this
-    # above 16 is allowed but the write will be rejected by the server
-    # for archives larger than ~15 MB. The error is caught and logged;
-    # the run itself is not aborted.
-    mongo_max_blob_mb: int = int(os.getenv("MONGO_MAX_BLOB_MB", "50"))
-
-    # Server-selection / connect timeout for MongoClient, in ms.
+    mongo_max_blob_mb: int = int(os.getenv("MONGO_MAX_BLOB_MB", "15"))
     mongo_timeout_ms: int = int(os.getenv("MONGO_TIMEOUT_MS", "10000"))
 
 

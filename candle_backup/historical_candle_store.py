@@ -4,16 +4,16 @@ Job A — ``ensure_recent_candles`` (historical, last N days)
 ----------------------------------------------------------
 1. For every instrument, build its on-disk path:
    ``data/<underlying>/<strike>_<strike_type>/historical.json``.
-2. If the instrument is **expired** — i.e. the current time is past
-   ``EXPIRY_CUTOFF_TIME`` on the instrument's expiry date — skip the
-   network call entirely and write a placeholder file containing an
-   empty ``candles`` list and an ``"expired": true`` marker.
-3. Otherwise, if the local file already covers the most recent market
-   day inside the lookback window, skip it.
-4. Otherwise, fetch the missing range from Upstox HistoryV3Api in
-   7-day chunks.
-5. Merge new candles with whatever was already stored, drop anything
-   older than ``HISTORY_LOOKBACK_DAYS``, and rewrite the file atomically.
+2. When ``HISTORY_STRICT_COMPLETENESS=true`` (default), always fetch the
+   full lookback window so the local file has every market day, with no
+   internal gaps. This is the mode intended for a backup job.
+   When it is ``false``, the old incremental skip applies: if the local
+   file already contains data through the previous trading day, it is
+   skipped.
+3. Fetch the missing range from Upstox ``HistoryV3Api`` in 7-day chunks.
+4. Merge new candles with whatever was already stored (fresh wins on
+   duplicate timestamps), drop anything older than
+   ``HISTORY_LOOKBACK_DAYS``, and rewrite the file atomically.
 
 Job B — ``ensure_intraday_candles`` (today only)
 ------------------------------------------------
@@ -22,11 +22,12 @@ weekday between ``settings.market_open_time`` and
 ``settings.market_close_time``. Uses the V3 intraday REST endpoint and
 merges the result into the same ``historical.json``.
 
-When ``INTRADAY_TEST_MODE=true`` the market-hours gate is bypassed
-entirely: the intraday step runs regardless of the day or time.
-
-Expired instruments are skipped by the intraday pass as well — no
-network call is attempted for them.
+Logging
+-------
+Dict payloads (job summaries, skip summaries) are emitted as JSON via
+``json_log``. When ``settings.instrument_errors_only`` is True, per-instrument
+progress lines are suppressed and only errors raised while processing an
+instrument are logged. Job-level start/finish summaries are always logged.
 """
 
 from __future__ import annotations
@@ -39,7 +40,6 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from candle_backup.config import settings
-from candle_backup.expiry import is_expired, parse_expiry_date
 from candle_backup.instrument_paths import build_candle_path
 from candle_backup.logger import get_logger
 from candle_backup.upstox_fetcher import fetch_historical, fetch_intraday
@@ -64,7 +64,6 @@ class HistoricalCandleStore:
         # Historical state.
         self.fetched_count = 0
         self.skipped_count = 0
-        self.expired_count = 0
         self.failed_count = 0
         self._processed_count = 0
         self._total_count = 0
@@ -72,7 +71,6 @@ class HistoricalCandleStore:
         # Intraday state.
         self.intraday_updated_count = 0
         self.intraday_empty_count = 0
-        self.intraday_expired_count = 0
         self.intraday_failed_count = 0
         self._intraday_processed_count = 0
         self._intraday_total_count = 0
@@ -92,14 +90,6 @@ class HistoricalCandleStore:
         return datetime.now(tz)
 
     def is_market_hours(self) -> bool:
-        """Return True if the current time is inside the market window.
-
-        When ``INTRADAY_TEST_MODE`` is true, this always returns True so
-        the intraday step runs regardless of day or time.
-        """
-        if settings.intraday_test_mode:
-            return True
-
         now = self._now_market_tz()
         if now.weekday() >= 5:
             return False
@@ -116,22 +106,28 @@ class HistoricalCandleStore:
         reason: str = "backup",
     ) -> dict[str, Any]:
         async with self._lock:
+            strict = settings.history_strict_completeness
+
             logger.info(
                 "Historical candle job started; reason=%s instruments=%d "
-                "concurrency=%d",
+                "concurrency=%d strict_completeness=%s",
                 reason,
                 len(instruments),
                 settings.history_max_concurrency,
+                strict,
             )
             self.fetched_count = 0
             self.skipped_count = 0
-            self.expired_count = 0
             self.failed_count = 0
             self._processed_count = 0
 
             lookback = max(1, settings.history_lookback_days)
+            overlap = max(0, settings.history_verify_overlap_days)
             to_date = date.today()
-            cutoff = to_date - timedelta(days=lookback)
+            # Extend the fetch window backwards by `overlap` days so we
+            # re-verify the days immediately before the rolling window.
+            # Upstox occasionally back-fills a late candle.
+            cutoff = to_date - timedelta(days=lookback + overlap)
 
             concurrency = max(1, settings.history_max_concurrency)
             self._semaphore = asyncio.Semaphore(concurrency)
@@ -140,7 +136,9 @@ class HistoricalCandleStore:
             self._total_count = len(valid_instruments)
 
             tasks = [
-                asyncio.create_task(self._process_instrument(item, cutoff, to_date))
+                asyncio.create_task(
+                    self._process_instrument(item, cutoff, to_date, strict)
+                )
                 for item in valid_instruments
             ]
             if tasks:
@@ -149,14 +147,14 @@ class HistoricalCandleStore:
             summary = {
                 "reason": reason,
                 "lookback_days": lookback,
+                "overlap_days": overlap,
+                "strict_completeness": strict,
                 "concurrency": concurrency,
                 "total": self._total_count,
                 "processed": self._processed_count,
                 "fetched": self.fetched_count,
                 "skipped": self.skipped_count,
-                "expired": self.expired_count,
                 "failed": self.failed_count,
-                "expiry_cutoff_time": settings.expiry_cutoff_time,
             }
             logger.info("Historical candle job completed; %s", summary)
             return summary
@@ -166,6 +164,7 @@ class HistoricalCandleStore:
         item: dict[str, Any],
         cutoff: date,
         to_date: date,
+        strict: bool,
     ) -> None:
         instrument_key = item.get("instrument_key")
         if not isinstance(instrument_key, str) or not instrument_key.strip():
@@ -173,35 +172,21 @@ class HistoricalCandleStore:
             self._processed_count += 1
             return
 
-        # ---- Expiry check (before any network call) -------------------
-        # An expired instrument no longer exists in Upstox's data, so
-        # fetching would only waste quota and return 4xx responses.
-        # We short-circuit here and write an empty placeholder file.
-        if is_expired(item):
-            target_path = build_candle_path(item)
-            self._save_expired(target_path, item)
-            self.expired_count += 1
-            self._processed_count += 1
-            logger.info(
-                "Historical fetch skipped (expired); instrument=%s "
-                "expiry=%s cutoff=%s %s",
-                instrument_key,
-                item.get("expiry"),
-                settings.expiry_cutoff_time,
-                settings.market_timezone,
-            )
-            return
-
         target_path = build_candle_path(item)
         existing = self._load_existing(target_path)
 
-        latest = self._latest_candle_date(existing)
-        expected_last = self._last_market_day(to_date - timedelta(days=1))
-
-        if latest is not None and latest >= expected_last:
-            self.skipped_count += 1
-            self._processed_count += 1
-            return
+        # ---- Decide whether to fetch -----------------------------------
+        if not strict:
+            # Incremental mode: skip if we already have data through the
+            # previous trading day. Fast, but can hide internal gaps.
+            latest = self._latest_candle_date(existing)
+            expected_last = self._last_market_day(to_date - timedelta(days=1))
+            if latest is not None and latest >= expected_last:
+                self.skipped_count += 1
+                self._processed_count += 1
+                return
+        # In strict mode we always fetch. A missing check is cheaper than
+        # a missed trading day.
 
         assert self._semaphore is not None
         async with self._semaphore:
@@ -221,10 +206,38 @@ class HistoricalCandleStore:
                 )
                 return
 
+        # Even a successful call may return an empty list (a fully-holiday
+        # range, or an upstream hiccup). Keep whatever is on disk.
+        if not candles and not existing:
+            self.failed_count += 1
+            self._processed_count += 1
+            logger.warning(
+                "Historical candle fetch returned no data; instrument=%s "
+                "range=%s..%s (no existing local data either)",
+                instrument_key,
+                cutoff.isoformat(),
+                to_date.isoformat(),
+            )
+            return
+
         merged = self._merge_and_trim(existing, candles, cutoff)
         self._save(target_path, merged)
         self.fetched_count += 1
         self._processed_count += 1
+
+        # Compact completeness report for this instrument: how many
+        # weekdays in the window have candles vs how many are expected.
+        expected_days = self._count_weekdays(cutoff, to_date)
+        present_days = self._count_weekdays_present(merged, cutoff, to_date)
+        logger.debug(
+            "Historical fetch done; instrument=%s candles=%d new=%d "
+            "weekdays_present=%d/%d",
+            instrument_key,
+            len(merged),
+            len(candles),
+            present_days,
+            expected_days,
+        )
 
     # ------------------------------------------------------------------ #
     # Intraday                                                           #
@@ -236,8 +249,6 @@ class HistoricalCandleStore:
     ) -> dict[str, Any]:
         async with self._lock:
             now_local = self._now_market_tz()
-            test_mode = settings.intraday_test_mode
-
             if not self.is_market_hours():
                 summary = {
                     "reason": reason,
@@ -249,12 +260,12 @@ class HistoricalCandleStore:
                         f"{settings.market_timezone})"
                     ),
                     "now_market_tz": now_local.isoformat(),
-                    "test_mode": test_mode,
+                    "test_mode": settings.intraday_test_mode,
                 }
                 logger.info("Intraday candle job skipped; %s", summary)
                 return summary
 
-            if test_mode:
+            if settings.intraday_test_mode:
                 logger.info(
                     "Intraday candle job running in TEST MODE; "
                     "market-hours gate bypassed; now=%s",
@@ -263,7 +274,6 @@ class HistoricalCandleStore:
 
             self.intraday_updated_count = 0
             self.intraday_empty_count = 0
-            self.intraday_expired_count = 0
             self.intraday_failed_count = 0
             self._intraday_processed_count = 0
 
@@ -288,14 +298,12 @@ class HistoricalCandleStore:
             summary = {
                 "reason": reason,
                 "skipped": False,
-                "test_mode": test_mode,
+                "test_mode": settings.intraday_test_mode,
                 "total": self._intraday_total_count,
                 "processed": self._intraday_processed_count,
                 "updated": self.intraday_updated_count,
                 "empty": self.intraday_empty_count,
-                "expired": self.intraday_expired_count,
                 "failed": self.intraday_failed_count,
-                "expiry_cutoff_time": settings.expiry_cutoff_time,
             }
             logger.info("Intraday candle job completed; %s", summary)
             return summary
@@ -308,12 +316,6 @@ class HistoricalCandleStore:
         instrument_key = item.get("instrument_key")
         if not isinstance(instrument_key, str) or not instrument_key.strip():
             self.intraday_empty_count += 1
-            self._intraday_processed_count += 1
-            return
-
-        # ---- Expiry check (no network call for expired instruments) ---
-        if is_expired(item):
-            self.intraday_expired_count += 1
             self._intraday_processed_count += 1
             return
 
@@ -371,36 +373,6 @@ class HistoricalCandleStore:
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(path)
 
-    def _save_expired(self, path: Path, item: dict[str, Any]) -> None:
-        """Write an empty placeholder for an expired instrument.
-
-        The file keeps the same JSON shape consumers expect, but the
-        ``candles`` list is empty and an ``expired`` marker is added so
-        downstream logic can distinguish "no data yet" from "no data
-        because the contract is finished".
-        """
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        expiry_date = parse_expiry_date(item.get("expiry"))
-
-        payload = {
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "count": 0,
-            "instrument_key": item.get("instrument_key"),
-            "trading_symbol": item.get("trading_symbol"),
-            "expiry": expiry_date.isoformat() if expiry_date else None,
-            "expired": True,
-            "reason": (
-                "instrument expired; no candles fetched "
-                f"(cutoff {settings.expiry_cutoff_time} "
-                f"{settings.market_timezone})"
-            ),
-            "candles": [],
-        }
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(path)
-
     def _latest_candle_date(
         self, candles: list[dict[str, Any]]
     ) -> date | None:
@@ -435,12 +407,48 @@ class HistoricalCandleStore:
                     return None
         return None
 
+    # ------------------------------------------------------------------ #
+    # Completeness helpers                                               #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _count_weekdays(start: date, end: date) -> int:
+        """Number of Mon-Fri days in [start, end] (inclusive)."""
+        if end < start:
+            return 0
+        n = 0
+        cursor = start
+        while cursor <= end:
+            if cursor.weekday() < 5:
+                n += 1
+            cursor += timedelta(days=1)
+        return n
+
+    def _count_weekdays_present(
+        self,
+        candles: list[dict[str, Any]],
+        start: date,
+        end: date,
+    ) -> int:
+        """Number of Mon-Fri days in [start, end] that have at least one candle."""
+        present: set[date] = set()
+        for candle in candles:
+            d = self._candle_date(candle.get("timestamp"))
+            if d is None or d < start or d > end:
+                continue
+            if d.weekday() < 5:
+                present.add(d)
+        return len(present)
+
     def _merge_and_trim(
         self,
         existing: list[dict[str, Any]],
         fresh: list[dict[str, Any]],
         cutoff: date,
     ) -> list[dict[str, Any]]:
+        """Merge ``existing`` and ``fresh``; fresh wins on duplicate ts.
+
+        Anything older than ``cutoff`` is dropped.
+        """
         merged: dict[str, dict[str, Any]] = {}
         for candle in list(existing) + list(fresh):
             ts = candle.get("timestamp")
