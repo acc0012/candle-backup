@@ -4,11 +4,15 @@ Job A — ``ensure_recent_candles`` (historical, last N days)
 ----------------------------------------------------------
 1. For every instrument, build its on-disk path:
    ``data/<underlying>/<strike>_<strike_type>/historical.json``.
-2. If the local file already covers the most recent market day inside
-   the lookback window, skip it.
-3. Otherwise, fetch the missing range from Upstox HistoryV3Api in
+2. If the instrument is **expired** — i.e. the current time is past
+   ``EXPIRY_CUTOFF_TIME`` on the instrument's expiry date — skip the
+   network call entirely and write a placeholder file containing an
+   empty ``candles`` list and an ``"expired": true`` marker.
+3. Otherwise, if the local file already covers the most recent market
+   day inside the lookback window, skip it.
+4. Otherwise, fetch the missing range from Upstox HistoryV3Api in
    7-day chunks.
-4. Merge new candles with whatever was already stored, drop anything
+5. Merge new candles with whatever was already stored, drop anything
    older than ``HISTORY_LOOKBACK_DAYS``, and rewrite the file atomically.
 
 Job B — ``ensure_intraday_candles`` (today only)
@@ -19,11 +23,10 @@ weekday between ``settings.market_open_time`` and
 merges the result into the same ``historical.json``.
 
 When ``INTRADAY_TEST_MODE=true`` the market-hours gate is bypassed
-entirely: the intraday step runs regardless of the day or time. This is
-useful for CI runs that happen before the market opens, and for manual
-verification. Note that the upstream endpoint will still return an
-empty list if there is no data for the current day — the flag only
-controls whether we *attempt* the fetch, not whether data exists.
+entirely: the intraday step runs regardless of the day or time.
+
+Expired instruments are skipped by the intraday pass as well — no
+network call is attempted for them.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from candle_backup.config import settings
+from candle_backup.expiry import is_expired, parse_expiry_date
 from candle_backup.instrument_paths import build_candle_path
 from candle_backup.logger import get_logger
 from candle_backup.upstox_fetcher import fetch_historical, fetch_intraday
@@ -60,6 +64,7 @@ class HistoricalCandleStore:
         # Historical state.
         self.fetched_count = 0
         self.skipped_count = 0
+        self.expired_count = 0
         self.failed_count = 0
         self._processed_count = 0
         self._total_count = 0
@@ -67,6 +72,7 @@ class HistoricalCandleStore:
         # Intraday state.
         self.intraday_updated_count = 0
         self.intraday_empty_count = 0
+        self.intraday_expired_count = 0
         self.intraday_failed_count = 0
         self._intraday_processed_count = 0
         self._intraday_total_count = 0
@@ -119,6 +125,7 @@ class HistoricalCandleStore:
             )
             self.fetched_count = 0
             self.skipped_count = 0
+            self.expired_count = 0
             self.failed_count = 0
             self._processed_count = 0
 
@@ -147,7 +154,9 @@ class HistoricalCandleStore:
                 "processed": self._processed_count,
                 "fetched": self.fetched_count,
                 "skipped": self.skipped_count,
+                "expired": self.expired_count,
                 "failed": self.failed_count,
+                "expiry_cutoff_time": settings.expiry_cutoff_time,
             }
             logger.info("Historical candle job completed; %s", summary)
             return summary
@@ -162,6 +171,25 @@ class HistoricalCandleStore:
         if not isinstance(instrument_key, str) or not instrument_key.strip():
             self.skipped_count += 1
             self._processed_count += 1
+            return
+
+        # ---- Expiry check (before any network call) -------------------
+        # An expired instrument no longer exists in Upstox's data, so
+        # fetching would only waste quota and return 4xx responses.
+        # We short-circuit here and write an empty placeholder file.
+        if is_expired(item):
+            target_path = build_candle_path(item)
+            self._save_expired(target_path, item)
+            self.expired_count += 1
+            self._processed_count += 1
+            logger.info(
+                "Historical fetch skipped (expired); instrument=%s "
+                "expiry=%s cutoff=%s %s",
+                instrument_key,
+                item.get("expiry"),
+                settings.expiry_cutoff_time,
+                settings.market_timezone,
+            )
             return
 
         target_path = build_candle_path(item)
@@ -235,6 +263,7 @@ class HistoricalCandleStore:
 
             self.intraday_updated_count = 0
             self.intraday_empty_count = 0
+            self.intraday_expired_count = 0
             self.intraday_failed_count = 0
             self._intraday_processed_count = 0
 
@@ -264,7 +293,9 @@ class HistoricalCandleStore:
                 "processed": self._intraday_processed_count,
                 "updated": self.intraday_updated_count,
                 "empty": self.intraday_empty_count,
+                "expired": self.intraday_expired_count,
                 "failed": self.intraday_failed_count,
+                "expiry_cutoff_time": settings.expiry_cutoff_time,
             }
             logger.info("Intraday candle job completed; %s", summary)
             return summary
@@ -277,6 +308,12 @@ class HistoricalCandleStore:
         instrument_key = item.get("instrument_key")
         if not isinstance(instrument_key, str) or not instrument_key.strip():
             self.intraday_empty_count += 1
+            self._intraday_processed_count += 1
+            return
+
+        # ---- Expiry check (no network call for expired instruments) ---
+        if is_expired(item):
+            self.intraday_expired_count += 1
             self._intraday_processed_count += 1
             return
 
@@ -329,6 +366,36 @@ class HistoricalCandleStore:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "count": len(candles),
             "candles": candles,
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _save_expired(self, path: Path, item: dict[str, Any]) -> None:
+        """Write an empty placeholder for an expired instrument.
+
+        The file keeps the same JSON shape consumers expect, but the
+        ``candles`` list is empty and an ``expired`` marker is added so
+        downstream logic can distinguish "no data yet" from "no data
+        because the contract is finished".
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        expiry_date = parse_expiry_date(item.get("expiry"))
+
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "count": 0,
+            "instrument_key": item.get("instrument_key"),
+            "trading_symbol": item.get("trading_symbol"),
+            "expiry": expiry_date.isoformat() if expiry_date else None,
+            "expired": True,
+            "reason": (
+                "instrument expired; no candles fetched "
+                f"(cutoff {settings.expiry_cutoff_time} "
+                f"{settings.market_timezone})"
+            ),
+            "candles": [],
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")

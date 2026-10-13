@@ -55,6 +55,18 @@ class Settings:
     market_open_time: str = os.getenv("MARKET_OPEN_TIME", "09:15")
     market_close_time: str = os.getenv("MARKET_CLOSE_TIME", "15:40")
 
+    # Expiry cutoff.
+    # An instrument is considered "expired" once the current time (in
+    # MARKET_TIMEZONE) has passed this time on the instrument's
+    # ``expiry`` date. Expired instruments are not fetched — an empty
+    # candles file with an "expired" marker is written instead.
+    #
+    # Instruments without an ``expiry`` field — index rows like
+    # "NSE_INDEX|Nifty 50" — are never treated as expired.
+    #
+    # Default: 16:00 IST (4pm on the expiry day).
+    expiry_cutoff_time: str = os.getenv("EXPIRY_CUTOFF_TIME", "16:00")
+
     # Intraday test mode.
     intraday_test_mode: bool = _env_bool("INTRADAY_TEST_MODE", False)
 

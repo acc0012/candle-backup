@@ -10,6 +10,16 @@ created:
     The archive bytes, stored as ``bson.Binary``. Only written when the
     archive is smaller than ``MONGO_MAX_BLOB_MB``.
 
+Timestamps
+----------
+Every document carries two timestamp fields:
+
+* ``updated_at``      — a human-readable India Standard Time string,
+                        e.g. ``"2026-10-13 18:13:27 IST"``.
+* ``updated_at_utc``  — the same instant as a timezone-aware UTC
+                        ``datetime`` so it stays sortable / indexable
+                        and can be range-queried.
+
 Every function is best-effort: a MongoDB failure is logged and swallowed
 so the backup itself never fails because of Mongo. All clients are
 closed before returning.
@@ -20,6 +30,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from bson import Binary
 from pymongo import MongoClient
@@ -29,6 +40,37 @@ from candle_backup.config import settings
 from candle_backup.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+
+# India Standard Time. Falls back to a fixed +05:30 offset if the
+# tzdata package is missing on the host.
+try:
+    _IST = ZoneInfo("Asia/Kolkata")
+except Exception:  # pragma: no cover — defensive
+    from datetime import timedelta as _td
+    _IST = timezone(_td(hours=5, minutes=30))
+
+
+def _now_utc() -> datetime:
+    """Timezone-aware UTC datetime for storage/indexing."""
+    return datetime.now(timezone.utc)
+
+
+def _now_ist_string() -> str:
+    """Human-readable IST string, e.g. ``2026-10-13 18:13:27 IST``."""
+    return datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def _timestamp_fields() -> dict[str, Any]:
+    """Return the timestamp pair every Mongo document receives."""
+    return {
+        "updated_at": _now_ist_string(),
+        "updated_at_utc": _now_utc(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -55,10 +97,6 @@ def _client() -> MongoClient | None:
     except Exception:
         logger.exception("Unable to create MongoClient")
         return None
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +127,7 @@ def save_metadata(
         "_id": settings.mongo_metadata_doc_id,
         **metadata,
         "file_link": file_link,
-        "updated_at": _now(),
+        **_timestamp_fields(),
     }
 
     try:
@@ -102,10 +140,12 @@ def save_metadata(
             upsert=True,
         )
         logger.info(
-            "Mongo metadata upserted; db=%s collection=%s doc=%s",
+            "Mongo metadata upserted; db=%s collection=%s doc=%s "
+            "updated_at=%s",
             settings.mongo_db_name,
             settings.mongo_metadata_collection,
             settings.mongo_metadata_doc_id,
+            doc["updated_at"],
         )
         return True
     except PyMongoError:
@@ -178,7 +218,7 @@ def save_blob_if_small(
         "folder": summary.get("folder"),
         "file_link": summary.get("file_link"),
         "data": Binary(data),
-        "updated_at": _now(),
+        **_timestamp_fields(),
     }
 
     try:
@@ -191,17 +231,16 @@ def save_blob_if_small(
             upsert=True,
         )
         logger.info(
-            "Mongo blob upserted; db=%s collection=%s doc=%s size=%d",
+            "Mongo blob upserted; db=%s collection=%s doc=%s size=%d "
+            "updated_at=%s",
             settings.mongo_db_name,
             settings.mongo_blob_collection,
             settings.mongo_blob_doc_id,
             size,
+            doc["updated_at"],
         )
         return {"saved": True, "size_bytes": size}
     except PyMongoError as exc:
-        # The common case for oversized docs is a server-side rejection
-        # ("BSONObjectTooLarge" / code 10334). Log it clearly and point
-        # the operator at the config knob.
         message = str(exc)
         if "too large" in message.lower() or "10334" in message:
             logger.error(
