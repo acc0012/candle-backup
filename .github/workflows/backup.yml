@@ -20,8 +20,8 @@ on:
         default: "manual"
       intraday_test_mode:
         description: "Run the intraday fetch outside market hours? (true/false)"
-        required: false
-        default: "false"
+        required: true
+        default: "true"
 
 concurrency:
   group: candle-backup
@@ -68,7 +68,7 @@ jobs:
           EMA_FAST_PERIOD_OVERRIDE: ${{ vars.EMA_FAST_PERIOD }}
           EMA_SLOW_PERIOD_OVERRIDE: ${{ vars.EMA_SLOW_PERIOD }}
           # ---- Manual-run input -------------------------------------
-          INTRADAY_TEST_MODE: ${{ github.event.inputs.intraday_test_mode || 'false' }}
+          INTRADAY_TEST_MODE: ${{ github.event.inputs.intraday_test_mode || 'true' }}
         run: |
           : "${MEGA_EMAIL:?MEGA_EMAIL secret is required}"
           : "${MEGA_PASSWORD:?MEGA_PASSWORD secret is required}"
