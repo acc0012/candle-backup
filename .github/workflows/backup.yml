@@ -10,6 +10,12 @@ on:
     # 17:00 IST (Asia/Kolkata) every day.
     # GitHub Actions cron is UTC; IST = UTC+05:30, so
     #   17:00 IST  ==  11:30 UTC the same calendar day.
+    #
+    # Runs after market close (15:40 IST) on purpose: by 17:00 the
+    # full day's 1-minute candles are available upstream, so the
+    # intraday fetch grabs the complete trading day and the EMA
+    # crosses are final for tomorrow's open. The market-hours gate
+    # is bypassed via INTRADAY_TEST_MODE=true below.
     - cron: "30 11 * * *"
 
   workflow_dispatch:
@@ -19,8 +25,8 @@ on:
         required: false
         default: "manual"
       intraday_test_mode:
-        description: "Run the intraday fetch outside market hours? (true/false)"
-        required: true
+        description: "Fetch intraday even outside market hours? (true/false)"
+        required: false
         default: "true"
 
 concurrency:
@@ -68,7 +74,11 @@ jobs:
           EMA_FAST_PERIOD_OVERRIDE: ${{ vars.EMA_FAST_PERIOD }}
           EMA_SLOW_PERIOD_OVERRIDE: ${{ vars.EMA_SLOW_PERIOD }}
           # ---- Manual-run input -------------------------------------
-          INTRADAY_TEST_MODE: ${{ github.event.inputs.intraday_test_mode || 'false' }}
+          # Scheduled runs have no input -> the fallback below
+          # ("true") applies, so intraday is fetched even though the
+          # 17:00 IST cron is outside the market window. Manual runs
+          # can explicitly pass "false" to disable it.
+          INTRADAY_TEST_MODE_INPUT: ${{ github.event.inputs.intraday_test_mode }}
         run: |
           : "${MEGA_EMAIL:?MEGA_EMAIL secret is required}"
           : "${MEGA_PASSWORD:?MEGA_PASSWORD secret is required}"
@@ -82,6 +92,12 @@ jobs:
           SENSEX_STRIKE_MAX="${SENSEX_STRIKE_MAX_OVERRIDE:-71000}"
           EMA_FAST_PERIOD="${EMA_FAST_PERIOD_OVERRIDE:-9}"
           EMA_SLOW_PERIOD="${EMA_SLOW_PERIOD_OVERRIDE:-21}"
+
+          # Scheduled runs have no input -> default to "true", so the
+          # 17:00 IST job pulls the full day's intraday candles even
+          # though it runs after MARKET_CLOSE_TIME. Manual runs can
+          # pass "false" to restore the market-hours gate.
+          INTRADAY_TEST_MODE="${INTRADAY_TEST_MODE_INPUT:-true}"
 
           if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
             TELEGRAM_ENABLED=true
@@ -142,6 +158,7 @@ jobs:
           echo "NIFTY_STRIKE range=${NIFTY_STRIKE_MIN}..${NIFTY_STRIKE_MAX}"
           echo "SENSEX_STRIKE range=${SENSEX_STRIKE_MIN}..${SENSEX_STRIKE_MAX}"
           echo "EMA_FAST=${EMA_FAST_PERIOD} EMA_SLOW=${EMA_SLOW_PERIOD}"
+          echo "INTRADAY_TEST_MODE=${INTRADAY_TEST_MODE}"
           echo "TELEGRAM_ENABLED=${TELEGRAM_ENABLED}"
           echo "MONGO_ENABLED=${MONGO_ENABLED}"
           echo "MONGO_DB_NAME=${MONGO_DB_NAME}"
