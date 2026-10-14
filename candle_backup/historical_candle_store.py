@@ -1,33 +1,15 @@
-"""Keep a rolling local cache of candles.
+"""Keep a rolling local cache of candles + EMA crosses.
 
 Job A — ``ensure_recent_candles`` (historical, last N days)
-----------------------------------------------------------
-1. For every instrument, build its on-disk path:
-   ``data/<underlying>/<strike>_<strike_type>/historical.json``.
-2. When ``HISTORY_STRICT_COMPLETENESS=true`` (default), always fetch the
-   full lookback window so the local file has every market day, with no
-   internal gaps. This is the mode intended for a backup job.
-   When it is ``false``, the old incremental skip applies: if the local
-   file already contains data through the previous trading day, it is
-   skipped.
-3. Fetch the missing range from Upstox ``HistoryV3Api`` in 7-day chunks.
-4. Merge new candles with whatever was already stored (fresh wins on
-   duplicate timestamps), drop anything older than
-   ``HISTORY_LOOKBACK_DAYS``, and rewrite the file atomically.
-
 Job B — ``ensure_intraday_candles`` (today only)
-------------------------------------------------
-Runs only when the current time (in ``settings.market_timezone``) is a
-weekday between ``settings.market_open_time`` and
-``settings.market_close_time``. Uses the V3 intraday REST endpoint and
-merges the result into the same ``historical.json``.
+Job C — ``compute_ema_crosses`` (writes ema_crosses.json)
 
-Logging
--------
-Dict payloads (job summaries, skip summaries) are emitted as JSON via
-``json_log``. When ``settings.instrument_errors_only`` is True, per-instrument
-progress lines are suppressed and only errors raised while processing an
-instrument are logged. Job-level start/finish summaries are always logged.
+The three jobs write into the same per-instrument directory:
+
+    data/<underlying>/<strike>_<type>/candles.json
+    data/<underlying>/<strike>_<type>/ema_crosses.json
+
+``ensure_candles_and_emas`` runs all three in order.
 """
 
 from __future__ import annotations
@@ -40,7 +22,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from candle_backup.config import settings
-from candle_backup.instrument_paths import build_candle_path
+from candle_backup.ema import detect_crosses
+from candle_backup.instrument_paths import (
+    build_candle_path,
+    build_ema_path,
+)
 from candle_backup.logger import get_logger
 from candle_backup.upstox_fetcher import fetch_historical, fetch_intraday
 
@@ -54,6 +40,13 @@ def _parse_hhmm(value: str) -> dt_time:
     except Exception:
         logger.warning("Invalid time value '%s'; falling back to 00:00", value)
         return dt_time(0, 0)
+
+
+def _json_default(obj: Any) -> str:
+    """Fallback serializer for datetimes/dates and anything else."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
 
 
 class HistoricalCandleStore:
@@ -75,8 +68,13 @@ class HistoricalCandleStore:
         self._intraday_processed_count = 0
         self._intraday_total_count = 0
 
+        # EMA state.
+        self.ema_files_written = 0
+        self.ema_total_crosses = 0
+        self.ema_failed_count = 0
+
     # ------------------------------------------------------------------ #
-    # Market hours helper                                                #
+    # Market hours                                                        #
     # ------------------------------------------------------------------ #
     def _now_market_tz(self) -> datetime:
         try:
@@ -98,7 +96,24 @@ class HistoricalCandleStore:
         return open_t <= now.time() <= close_t
 
     # ------------------------------------------------------------------ #
-    # Historical                                                         #
+    # Top-level orchestrator                                              #
+    # ------------------------------------------------------------------ #
+    async def ensure_candles_and_emas(
+        self,
+        instruments: list[dict[str, Any]],
+        reason: str = "backup",
+    ) -> dict[str, Any]:
+        hist = await self.ensure_recent_candles(instruments, reason=reason)
+        intra = await self.ensure_intraday_candles(instruments, reason=reason)
+        ema = self.compute_ema_crosses(instruments, reason=reason)
+        return {
+            "historical": hist,
+            "intraday": intra,
+            "ema_crosses": ema,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Historical                                                          #
     # ------------------------------------------------------------------ #
     async def ensure_recent_candles(
         self,
@@ -124,9 +139,6 @@ class HistoricalCandleStore:
             lookback = max(1, settings.history_lookback_days)
             overlap = max(0, settings.history_verify_overlap_days)
             to_date = date.today()
-            # Extend the fetch window backwards by `overlap` days so we
-            # re-verify the days immediately before the rolling window.
-            # Upstox occasionally back-fills a late candle.
             cutoff = to_date - timedelta(days=lookback + overlap)
 
             concurrency = max(1, settings.history_max_concurrency)
@@ -175,18 +187,13 @@ class HistoricalCandleStore:
         target_path = build_candle_path(item)
         existing = self._load_existing(target_path)
 
-        # ---- Decide whether to fetch -----------------------------------
         if not strict:
-            # Incremental mode: skip if we already have data through the
-            # previous trading day. Fast, but can hide internal gaps.
             latest = self._latest_candle_date(existing)
             expected_last = self._last_market_day(to_date - timedelta(days=1))
             if latest is not None and latest >= expected_last:
                 self.skipped_count += 1
                 self._processed_count += 1
                 return
-        # In strict mode we always fetch. A missing check is cheaper than
-        # a missed trading day.
 
         assert self._semaphore is not None
         async with self._semaphore:
@@ -206,8 +213,6 @@ class HistoricalCandleStore:
                 )
                 return
 
-        # Even a successful call may return an empty list (a fully-holiday
-        # range, or an upstream hiccup). Keep whatever is on disk.
         if not candles and not existing:
             self.failed_count += 1
             self._processed_count += 1
@@ -225,22 +230,8 @@ class HistoricalCandleStore:
         self.fetched_count += 1
         self._processed_count += 1
 
-        # Compact completeness report for this instrument: how many
-        # weekdays in the window have candles vs how many are expected.
-        expected_days = self._count_weekdays(cutoff, to_date)
-        present_days = self._count_weekdays_present(merged, cutoff, to_date)
-        logger.debug(
-            "Historical fetch done; instrument=%s candles=%d new=%d "
-            "weekdays_present=%d/%d",
-            instrument_key,
-            len(merged),
-            len(candles),
-            present_days,
-            expected_days,
-        )
-
     # ------------------------------------------------------------------ #
-    # Intraday                                                           #
+    # Intraday                                                            #
     # ------------------------------------------------------------------ #
     async def ensure_intraday_candles(
         self,
@@ -249,7 +240,7 @@ class HistoricalCandleStore:
     ) -> dict[str, Any]:
         async with self._lock:
             now_local = self._now_market_tz()
-            if not self.is_market_hours():
+            if not self.is_market_hours() and not settings.intraday_test_mode:
                 summary = {
                     "reason": reason,
                     "skipped": True,
@@ -265,7 +256,7 @@ class HistoricalCandleStore:
                 logger.info("Intraday candle job skipped; %s", summary)
                 return summary
 
-            if settings.intraday_test_mode:
+            if settings.intraday_test_mode and not self.is_market_hours():
                 logger.info(
                     "Intraday candle job running in TEST MODE; "
                     "market-hours gate bypassed; now=%s",
@@ -325,7 +316,9 @@ class HistoricalCandleStore:
         assert self._semaphore is not None
         async with self._semaphore:
             try:
-                candles = await asyncio.to_thread(fetch_intraday, instrument_key)
+                candles = await asyncio.to_thread(
+                    fetch_intraday, instrument_key
+                )
             except Exception:
                 self.intraday_failed_count += 1
                 self._intraday_processed_count += 1
@@ -346,7 +339,83 @@ class HistoricalCandleStore:
         self._intraday_processed_count += 1
 
     # ------------------------------------------------------------------ #
-    # Disk IO / freshness                                                #
+    # EMA crosses                                                         #
+    # ------------------------------------------------------------------ #
+    def compute_ema_crosses(
+        self,
+        instruments: list[dict[str, Any]],
+        reason: str = "backup",
+    ) -> dict[str, Any]:
+        """Load each candle file, detect EMA crosses, write ema_crosses.json."""
+        fast = settings.ema_fast_period
+        slow = settings.ema_slow_period
+
+        self.ema_files_written = 0
+        self.ema_total_crosses = 0
+        self.ema_failed_count = 0
+
+        for item in instruments:
+            if not isinstance(item, dict):
+                continue
+            instrument_key = item.get("instrument_key")
+            if not isinstance(instrument_key, str) or not instrument_key.strip():
+                continue
+
+            candle_path = build_candle_path(item)
+            candles = self._load_existing(candle_path)
+            if not candles:
+                continue
+
+            try:
+                crosses = detect_crosses(candles, fast, slow)
+            except Exception:
+                self.ema_failed_count += 1
+                logger.exception(
+                    "EMA cross computation failed; instrument=%s",
+                    instrument_key,
+                )
+                continue
+
+            payload = {
+                "instrument_key": instrument_key,
+                "underlying": item.get("underlying_symbol")
+                or item.get("underlying_key"),
+                "strike_price": item.get("strike_price"),
+                "strike_type": item.get("instrument_type"),
+                "expiry": item.get("expiry"),
+                "trading_symbol": item.get("trading_symbol"),
+                "fast_period": fast,
+                "slow_period": slow,
+                "candle_count": len(candles),
+                "cross_count": len(crosses),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "crosses": crosses,
+            }
+            try:
+                self._save_ema(build_ema_path(item), payload)
+                self.ema_files_written += 1
+                self.ema_total_crosses += len(crosses)
+            except Exception:
+                self.ema_failed_count += 1
+                logger.exception(
+                    "EMA file write failed; instrument=%s path=%s",
+                    instrument_key,
+                    build_ema_path(item),
+                )
+
+        summary = {
+            "reason": reason,
+            "fast_period": fast,
+            "slow_period": slow,
+            "files_written": self.ema_files_written,
+            "total_crosses": self.ema_total_crosses,
+            "failed": self.ema_failed_count,
+        }
+        logger.info("EMA cross job completed; %s", summary)
+        return summary
+
+    # ------------------------------------------------------------------ #
+    # Disk IO / freshness                                                 #
     # ------------------------------------------------------------------ #
     def _load_existing(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
@@ -357,7 +426,9 @@ class HistoricalCandleStore:
             logger.exception("Unable to read existing candle file: %s", path)
             return []
 
-        candles = payload.get("candles") if isinstance(payload, dict) else payload
+        candles = (
+            payload.get("candles") if isinstance(payload, dict) else payload
+        )
         if not isinstance(candles, list):
             return []
         return [c for c in candles if isinstance(c, dict)]
@@ -370,7 +441,19 @@ class HistoricalCandleStore:
             "candles": candles,
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(payload, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+
+    def _save_ema(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
         tmp.replace(path)
 
     def _latest_candle_date(
@@ -399,7 +482,9 @@ class HistoricalCandleStore:
             return ts
         if isinstance(ts, str):
             try:
-                return datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+                return datetime.fromisoformat(
+                    ts.replace("Z", "+00:00")
+                ).date()
             except ValueError:
                 try:
                     return datetime.strptime(ts[:10], "%Y-%m-%d").date()
@@ -407,48 +492,12 @@ class HistoricalCandleStore:
                     return None
         return None
 
-    # ------------------------------------------------------------------ #
-    # Completeness helpers                                               #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _count_weekdays(start: date, end: date) -> int:
-        """Number of Mon-Fri days in [start, end] (inclusive)."""
-        if end < start:
-            return 0
-        n = 0
-        cursor = start
-        while cursor <= end:
-            if cursor.weekday() < 5:
-                n += 1
-            cursor += timedelta(days=1)
-        return n
-
-    def _count_weekdays_present(
-        self,
-        candles: list[dict[str, Any]],
-        start: date,
-        end: date,
-    ) -> int:
-        """Number of Mon-Fri days in [start, end] that have at least one candle."""
-        present: set[date] = set()
-        for candle in candles:
-            d = self._candle_date(candle.get("timestamp"))
-            if d is None or d < start or d > end:
-                continue
-            if d.weekday() < 5:
-                present.add(d)
-        return len(present)
-
     def _merge_and_trim(
         self,
         existing: list[dict[str, Any]],
         fresh: list[dict[str, Any]],
         cutoff: date,
     ) -> list[dict[str, Any]]:
-        """Merge ``existing`` and ``fresh``; fresh wins on duplicate ts.
-
-        Anything older than ``cutoff`` is dropped.
-        """
         merged: dict[str, dict[str, Any]] = {}
         for candle in list(existing) + list(fresh):
             ts = candle.get("timestamp")
@@ -458,7 +507,9 @@ class HistoricalCandleStore:
             if day is None or day < cutoff:
                 continue
             merged[str(ts)] = candle
-        return sorted(merged.values(), key=lambda c: str(c.get("timestamp", "")))
+        return sorted(
+            merged.values(), key=lambda c: str(c.get("timestamp", ""))
+        )
 
 
 historical_candle_store = HistoricalCandleStore()

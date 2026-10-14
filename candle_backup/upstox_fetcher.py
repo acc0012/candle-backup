@@ -1,35 +1,40 @@
 """Upstox data helpers.
 
-- ``fetch_historical`` uses the Upstox Python SDK (HistoryV3Api) in
-  7-day chunks.
-- ``fetch_intraday`` uses ``requests`` against the V3 REST endpoint
-  directly, which keeps the call fully synchronous and lets
-  ``asyncio.to_thread`` manage concurrency cleanly.
+- ``fetch_historical`` uses ``HistoryV3Api.get_historical_candle_data1``
+  in 7-day chunks.
+- ``fetch_intraday`` uses ``HistoryV3Api.get_intra_day_candle_data``.
+
+Both endpoints are public and require **no access token**. The SDK is
+constructed bare (``HistoryV3Api()``) with no ``Configuration`` object,
+matching the official documentation examples. Instrument discovery is
+handled separately in ``instruments_service`` — this module only
+fetches candles.
 """
 
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Any
-from urllib.parse import quote
+from typing import TYPE_CHECKING, Any
 
-import requests
-
-from candle_backup.config import settings
 from candle_backup.logger import get_logger
 
-try:  # pragma: no cover - optional dependency
+# Import the SDK twice:
+#   * under TYPE_CHECKING  -> Pylance sees a real module and can resolve
+#                             the SDK's classes during static analysis.
+#   * at runtime           -> tolerant import; ``None`` if the SDK is
+#                             missing so the tool can fail with a clear
+#                             RuntimeError instead of ImportError.
+if TYPE_CHECKING:  # pragma: no cover - type-checker only
     import upstox_client  # type: ignore
-except ImportError:  # pragma: no cover
-    upstox_client = None  # type: ignore
+else:  # pragma: no cover - runtime
+    try:
+        import upstox_client  # type: ignore
+    except ImportError:
+        upstox_client = None  # type: ignore[assignment]
 
 logger = get_logger(__name__)
 
-# Upstox HistoryV3 accepts at most ~7 days per request for minute data.
 CHUNK_DAYS = 7
-
-# V3 Intraday REST endpoint base.
-_INTRADAY_BASE = "https://api.upstox.com/v3/historical-candle/intraday"
 
 
 def _require_sdk() -> None:
@@ -40,14 +45,23 @@ def _require_sdk() -> None:
         )
 
 
+def _api() -> Any:
+    """Return a bare ``HistoryV3Api`` instance.
+
+    No ``Configuration`` and no ``access_token`` — the historical and
+    intraday candle endpoints are public.
+    """
+    _require_sdk()
+    return upstox_client.HistoryV3Api()
+
+
 def fetch_historical(
     instrument_key: str,
     from_date: date,
     to_date: date,
 ) -> list[dict[str, Any]]:
-    """Fetch history in 7-day chunks via the SDK; returns [] on total failure."""
-    _require_sdk()
-    api = upstox_client.HistoryV3Api()
+    """Fetch history in 7-day chunks; returns [] when every chunk fails."""
+    api = _api()
     collected: list[dict[str, Any]] = []
 
     cursor = from_date
@@ -72,33 +86,18 @@ def fetch_historical(
                 exc,
             )
         cursor = chunk_end + timedelta(days=1)
-
     return collected
 
 
 def fetch_intraday(instrument_key: str) -> list[dict[str, Any]]:
-    """Fetch today's 1-minute candles from the V3 REST endpoint."""
-    encoded_key = quote(instrument_key, safe="")
-    url = f"{_INTRADAY_BASE}/{encoded_key}/minutes/1"
-
-    response = requests.get(
-        url,
-        headers={"Accept": "application/json"},
-        timeout=settings.request_timeout_seconds,
-    )
-
-    if response.status_code != 200:
-        response.raise_for_status()
-
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError("Upstox intraday response must be a JSON object")
-
-    return extract_candles(payload)
+    """Today's 1-minute candles via ``get_intra_day_candle_data``."""
+    api = _api()
+    response = api.get_intra_day_candle_data(instrument_key, "minutes", "1")
+    return extract_candles(response)
 
 
 def extract_candles(response: Any) -> list[dict[str, Any]]:
-    """Normalise an SDK object or a REST JSON payload into candle dicts."""
+    """Normalise an SDK object or REST JSON payload into candle dicts."""
     data: Any = response
 
     if hasattr(data, "data"):

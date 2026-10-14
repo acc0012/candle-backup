@@ -7,8 +7,10 @@ on:
       - master
 
   schedule:
-    # 05:00 IST (Asia/Kolkata) Monday–Saturday.
-    - cron: "30 23 * * 0-5"
+    # 17:00 IST (Asia/Kolkata) every day.
+    # GitHub Actions cron is UTC; IST = UTC+05:30, so
+    #   17:00 IST  ==  11:30 UTC the same calendar day.
+    - cron: "30 11 * * *"
 
   workflow_dispatch:
     inputs:
@@ -48,24 +50,38 @@ jobs:
 
       - name: Write .env
         env:
-          SUBSCRIPTIONS_API_URL: ${{ secrets.SUBSCRIPTIONS_API_URL }}
+          # ---- Required secrets -------------------------------------
           MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+          # ---- Optional secrets -------------------------------------
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MONGO_URL: ${{ secrets.MONGO_URL }}
+          # ---- Optional repository variables ------------------------
           MEGA_BACKUP_FOLDER_OVERRIDE: ${{ vars.MEGA_BACKUP_FOLDER }}
           MONGO_DB_NAME_OVERRIDE: ${{ vars.MONGO_DB_NAME }}
           MONGO_MAX_BLOB_MB_OVERRIDE: ${{ vars.MONGO_MAX_BLOB_MB }}
+          NIFTY_STRIKE_MIN_OVERRIDE: ${{ vars.NIFTY_STRIKE_MIN }}
+          NIFTY_STRIKE_MAX_OVERRIDE: ${{ vars.NIFTY_STRIKE_MAX }}
+          SENSEX_STRIKE_MIN_OVERRIDE: ${{ vars.SENSEX_STRIKE_MIN }}
+          SENSEX_STRIKE_MAX_OVERRIDE: ${{ vars.SENSEX_STRIKE_MAX }}
+          EMA_FAST_PERIOD_OVERRIDE: ${{ vars.EMA_FAST_PERIOD }}
+          EMA_SLOW_PERIOD_OVERRIDE: ${{ vars.EMA_SLOW_PERIOD }}
+          # ---- Manual-run input -------------------------------------
           INTRADAY_TEST_MODE: ${{ github.event.inputs.intraday_test_mode || 'false' }}
         run: |
-          : "${SUBSCRIPTIONS_API_URL:?SUBSCRIPTIONS_API_URL secret is required}"
           : "${MEGA_EMAIL:?MEGA_EMAIL secret is required}"
           : "${MEGA_PASSWORD:?MEGA_PASSWORD secret is required}"
 
           MEGA_BACKUP_FOLDER="${MEGA_BACKUP_FOLDER_OVERRIDE:-novag7_candles_backup}"
           MONGO_DB_NAME="${MONGO_DB_NAME_OVERRIDE:-UPSTOX_APP_V2}"
-          MONGO_MAX_BLOB_MB="${MONGO_MAX_BLOB_MB_OVERRIDE:-50}"
+          MONGO_MAX_BLOB_MB="${MONGO_MAX_BLOB_MB_OVERRIDE:-15}"
+          NIFTY_STRIKE_MIN="${NIFTY_STRIKE_MIN_OVERRIDE:-21000}"
+          NIFTY_STRIKE_MAX="${NIFTY_STRIKE_MAX_OVERRIDE:-26000}"
+          SENSEX_STRIKE_MIN="${SENSEX_STRIKE_MIN_OVERRIDE:-71000}"
+          SENSEX_STRIKE_MAX="${SENSEX_STRIKE_MAX_OVERRIDE:-71000}"
+          EMA_FAST_PERIOD="${EMA_FAST_PERIOD_OVERRIDE:-9}"
+          EMA_SLOW_PERIOD="${EMA_SLOW_PERIOD_OVERRIDE:-21}"
 
           if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
             TELEGRAM_ENABLED=true
@@ -80,17 +96,28 @@ jobs:
           fi
 
           cat > .env <<EOF
-          SUBSCRIPTIONS_API_URL=${SUBSCRIPTIONS_API_URL}
           REQUEST_TIMEOUT_SECONDS=30
           LOG_LEVEL=INFO
           LOG_FILE=logs/backup.log
           DATA_DIR=data
           HISTORY_LOOKBACK_DAYS=10
           HISTORY_MAX_CONCURRENCY=8
+          HISTORY_STRICT_COMPLETENESS=true
+          HISTORY_VERIFY_OVERLAP_DAYS=1
           MARKET_TIMEZONE=Asia/Kolkata
           MARKET_OPEN_TIME=09:15
           MARKET_CLOSE_TIME=15:40
           INTRADAY_TEST_MODE=${INTRADAY_TEST_MODE}
+          INSTRUMENTS_URL=https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz
+          INSTRUMENTS_CACHE_DIR=data/_cache
+          NIFTY_UNDERLYING=NIFTY
+          SENSEX_UNDERLYING=SENSEX
+          NIFTY_STRIKE_MIN=${NIFTY_STRIKE_MIN}
+          NIFTY_STRIKE_MAX=${NIFTY_STRIKE_MAX}
+          SENSEX_STRIKE_MIN=${SENSEX_STRIKE_MIN}
+          SENSEX_STRIKE_MAX=${SENSEX_STRIKE_MAX}
+          EMA_FAST_PERIOD=${EMA_FAST_PERIOD}
+          EMA_SLOW_PERIOD=${EMA_SLOW_PERIOD}
           MEGA_ENABLED=true
           MEGA_EMAIL=${MEGA_EMAIL}
           MEGA_PASSWORD=${MEGA_PASSWORD}
@@ -111,8 +138,10 @@ jobs:
           EOF
 
           echo "Wrote .env"
-          echo "SUBSCRIPTIONS_API_URL set (length ${#SUBSCRIPTIONS_API_URL})"
           echo "MEGA_BACKUP_FOLDER=${MEGA_BACKUP_FOLDER}"
+          echo "NIFTY_STRIKE range=${NIFTY_STRIKE_MIN}..${NIFTY_STRIKE_MAX}"
+          echo "SENSEX_STRIKE range=${SENSEX_STRIKE_MIN}..${SENSEX_STRIKE_MAX}"
+          echo "EMA_FAST=${EMA_FAST_PERIOD} EMA_SLOW=${EMA_SLOW_PERIOD}"
           echo "TELEGRAM_ENABLED=${TELEGRAM_ENABLED}"
           echo "MONGO_ENABLED=${MONGO_ENABLED}"
           echo "MONGO_DB_NAME=${MONGO_DB_NAME}"
@@ -127,6 +156,8 @@ jobs:
           du -sh data/ || true
           echo "File count:"
           find data/ -type f | wc -l || true
+          echo "Options folders:"
+          ls -R data/nifty data/sensex 2>/dev/null | head -50 || true
 
       - name: Upload logs on failure
         if: failure()

@@ -8,10 +8,10 @@ from pathlib import Path
 
 from candle_backup.config import settings
 from candle_backup.historical_candle_store import historical_candle_store
+from candle_backup.instruments_service import discover_instruments
 from candle_backup.logger import get_logger
 from candle_backup.mega_backup_service import backup_to_mega
 from candle_backup.mongo_service import save_blob_if_small, save_metadata
-from candle_backup.subscription_store import subscription_store
 from candle_backup.telegram_service import telegram_service
 
 logger = get_logger(__name__)
@@ -22,40 +22,47 @@ def _now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Instrument discovery
+# ---------------------------------------------------------------------------
+
+def _discover_instruments() -> list[dict]:
+    """Download the free archive and filter to nearest-expiry options.
+
+    Runs in a thread because it does network IO and gzip parsing.
+    """
+    logger.info(
+        "Fetch: discovering instruments from free archive (%s)",
+        settings.instruments_url,
+    )
+    contracts = discover_instruments()
+    logger.info("Fetch: %d contracts after filtering", len(contracts))
+    return contracts
+
+
+# ---------------------------------------------------------------------------
 # Fetch phase
 # ---------------------------------------------------------------------------
 
 async def _do_fetch() -> tuple[int, dict]:
-    """Run fetch jobs. Returns (exit_code, summary_dict)."""
-    logger.info("Fetch: refreshing subscriptions")
     try:
-        await subscription_store.refresh(reason="standalone-backup")
+        instruments = await asyncio.to_thread(_discover_instruments)
     except Exception as exc:
-        logger.exception("Subscription refresh failed")
-        return 2, {"stage": "subscriptions", "error": str(exc)}
+        logger.exception("Instrument discovery failed")
+        return 2, {"stage": "instruments", "error": str(exc)}
 
-    instruments = subscription_store.snapshot().get("active", []) or []
-    logger.info("Fetch: %d active instruments", len(instruments))
     if not instruments:
-        logger.error("No instruments returned; aborting")
-        return 3, {"stage": "subscriptions", "error": "no instruments"}
+        return 3, {"stage": "instruments", "error": "no instruments"}
 
-    logger.info("Fetch: historical candles")
-    hist = await historical_candle_store.ensure_recent_candles(
+    logger.info("Fetch: historical + intraday candles and EMA crosses")
+    summary = await historical_candle_store.ensure_candles_and_emas(
         instruments, reason="standalone-backup"
     )
-    logger.info("Fetch: historical done %s", hist)
-
-    logger.info("Fetch: intraday candles")
-    intra = await historical_candle_store.ensure_intraday_candles(
-        instruments, reason="standalone-backup"
-    )
-    logger.info("Fetch: intraday done %s", intra)
 
     return 0, {
         "instruments": len(instruments),
-        "historical": hist,
-        "intraday": intra,
+        "historical": summary["historical"],
+        "intraday": summary["intraday"],
+        "ema_crosses": summary["ema_crosses"],
     }
 
 
@@ -64,16 +71,7 @@ async def _do_fetch() -> tuple[int, dict]:
 # ---------------------------------------------------------------------------
 
 def _do_backup(metadata: dict) -> tuple[int, dict]:
-    """Run the MEGA upload. Returns (exit_code, summary_dict).
-
-    A post-upload hook persists the run metadata and (when small
-    enough) the archive bytes to MongoDB. The hook runs while the
-    archive still exists in the temp directory.
-    """
-
     def _hook(archive_path: Path, summary: dict) -> None:
-        # Merge the caller-supplied metadata with the archive summary
-        # so the Mongo document carries everything in one place.
         merged = {**metadata, **summary}
         save_metadata(merged, summary.get("file_link"))
         blob_result = save_blob_if_small(archive_path, summary)
@@ -81,10 +79,7 @@ def _do_backup(metadata: dict) -> tuple[int, dict]:
 
     logger.info("Backup: zipping data/ and uploading to MEGA")
     try:
-        summary = backup_to_mega(
-            metadata=metadata,
-            post_upload=_hook,
-        )
+        summary = backup_to_mega(metadata=metadata, post_upload=_hook)
     except Exception as exc:
         logger.exception("Backup failed")
         return 1, {"stage": "backup", "error": str(exc)}
@@ -116,7 +111,6 @@ def _build_metadata(
     do_fetch: bool,
     do_backup: bool,
 ) -> dict:
-    """Assemble the structured metadata written into data.zip and Mongo."""
     run_completed_at = _now_iso()
     duration = None
     try:
@@ -141,16 +135,17 @@ def _build_metadata(
             "close_time": settings.market_close_time,
             "intraday_test_mode": settings.intraday_test_mode,
         },
-        # Mirrors the top-level _manifest.txt fields.
         "run_started_at": run_started_at,
         "run_completed_at": run_completed_at,
     }
 
     if fetch_summary:
         metadata["fetch"] = {
+            "source": "upstox-archive",
             "instruments_total": fetch_summary.get("instruments"),
             "historical": fetch_summary.get("historical"),
             "intraday": fetch_summary.get("intraday"),
+            "ema_crosses": fetch_summary.get("ema_crosses"),
         }
     else:
         metadata["fetch"] = None
@@ -177,13 +172,13 @@ def _build_metadata(
 async def run(do_fetch: bool, do_backup: bool) -> int:
     run_started_at = _now_iso()
 
-    # ---- Telegram: start ------------------------------------------------
     try:
         telegram_service.notify_start(
             {
                 "project": "candle-backup",
                 "fetch": "enabled" if do_fetch else "disabled",
                 "backup": "enabled" if do_backup else "disabled",
+                "source": "upstox-archive",
                 "started_at": run_started_at,
             }
         )
@@ -195,7 +190,6 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
     fetch_summary: dict | None = None
     backup_summary: dict | None = None
 
-    # ---- Run ------------------------------------------------------------
     try:
         if do_fetch:
             rc, fetch_summary = await _do_fetch()
@@ -229,8 +223,10 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
             failure_error = f"{type(exc).__name__}: {exc}"
             logger.exception("Unhandled exception during run")
 
-        elapsed = (datetime.now(timezone.utc) -
-                   datetime.fromisoformat(run_started_at)).total_seconds()
+        elapsed = (
+            datetime.now(timezone.utc)
+            - datetime.fromisoformat(run_started_at)
+        ).total_seconds()
         try:
             telegram_service.notify_failure(
                 failure_error,
@@ -245,15 +241,23 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
 
         return exit_code or 1
 
-    # ---- Telegram: success ----------------------------------------------
-    elapsed = (datetime.now(timezone.utc) -
-               datetime.fromisoformat(run_started_at)).total_seconds()
+    elapsed = (
+        datetime.now(timezone.utc) - datetime.fromisoformat(run_started_at)
+    ).total_seconds()
 
     details: dict[str, object] = {
         "project": "candle-backup",
         "elapsed_seconds": f"{elapsed:.1f}",
         "completed_at": _now_iso(),
     }
+
+    if fetch_summary:
+        details["source"] = "upstox-archive"
+        details["instruments"] = fetch_summary.get("instruments")
+        ema = fetch_summary.get("ema_crosses") or {}
+        if ema:
+            details["ema_files"] = ema.get("files_written")
+            details["ema_total_crosses"] = ema.get("total_crosses")
 
     if backup_summary:
         details["archive"] = backup_summary.get("archive_name")
@@ -265,7 +269,9 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
 
         mongo_blob = backup_summary.get("mongo_blob") or {}
         if mongo_blob.get("saved"):
-            details["mongo_blob"] = f"saved ({_format_bytes(mongo_blob.get('size_bytes'))})"
+            details["mongo_blob"] = (
+                f"saved ({_format_bytes(mongo_blob.get('size_bytes'))})"
+            )
         elif mongo_blob:
             details["mongo_blob"] = mongo_blob.get("reason", "skipped")
 

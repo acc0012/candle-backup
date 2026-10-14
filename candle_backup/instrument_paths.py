@@ -4,15 +4,17 @@ Layout
 ------
 Options and futures::
 
-    data/<underlying>/<strike>_<strike_type>/historical.json
+    data/<underlying>/<strike>_<strike_type>/candles.json
+    data/<underlying>/<strike>_<strike_type>/ema_crosses.json
 
-Index / underlying rows (e.g. ``NSE_INDEX|Nifty 50``)::
+Index / underlying rows::
 
-    data/index/<underlying>/historical.json
+    data/index/<underlying>/candles.json
+    data/index/<underlying>/ema_crosses.json
 
 Non-option, non-index instruments (fallback)::
 
-    data/<underlying>/<instrument_type or 'spot'>/historical.json
+    data/<underlying>/<instrument_type or 'spot'>/candles.json
 """
 
 from __future__ import annotations
@@ -23,9 +25,6 @@ from typing import Any
 
 from candle_backup.config import settings
 
-# ---------------------------------------------------------------------------
-# Underlying / index name normalisation
-# ---------------------------------------------------------------------------
 _INDEX_ALIASES: dict[str, str] = {
     "nifty50": "nifty",
     "nifty": "nifty",
@@ -52,9 +51,6 @@ def _strip_index_prefix(value: str) -> str:
     return value
 
 
-# ---------------------------------------------------------------------------
-# Index instrument detection
-# ---------------------------------------------------------------------------
 def is_index_instrument(item: dict[str, Any]) -> bool:
     ikey = str(item.get("instrument_key") or "")
     if ikey.startswith("NSE_INDEX|") or ikey.startswith("BSE_INDEX|"):
@@ -70,9 +66,6 @@ def is_index_instrument(item: dict[str, Any]) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Underlying resolution
-# ---------------------------------------------------------------------------
 def resolve_underlying(item: dict[str, Any]) -> str:
     for key in ("underlying", "underlying_symbol", "asset", "root_symbol"):
         value = item.get(key)
@@ -95,9 +88,6 @@ def resolve_underlying(item: dict[str, Any]) -> str:
     return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# Directory + file paths
-# ---------------------------------------------------------------------------
 def _instrument_dir(item: dict[str, Any]) -> Path:
     underlying = resolve_underlying(item)
 
@@ -124,13 +114,15 @@ def _instrument_dir(item: dict[str, Any]) -> Path:
 
 
 def build_candle_path(item: dict[str, Any]) -> Path:
-    """Path to the merged history+intraday candle file."""
-    return _instrument_dir(item) / "historical.json"
+    """Path to the merged candles file (historical + intraday)."""
+    return _instrument_dir(item) / "candles.json"
 
 
-# ---------------------------------------------------------------------------
-# Per-file write locks
-# ---------------------------------------------------------------------------
+def build_ema_path(item: dict[str, Any]) -> Path:
+    """Path to the EMA crosses file."""
+    return _instrument_dir(item) / "ema_crosses.json"
+
+
 _write_locks: dict[str, threading.Lock] = {}
 _write_locks_guard = threading.Lock()
 
