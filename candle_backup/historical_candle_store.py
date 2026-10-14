@@ -10,6 +10,21 @@ The three jobs write into the same per-instrument directory:
     data/<underlying>/<strike>_<type>/ema_crosses.json
 
 ``ensure_candles_and_emas`` runs all three in order.
+
+Intraday window
+---------------
+The intraday fetch is **time-window gated**, not market-hours gated.
+It runs whenever the current time in ``MARKET_TIMEZONE`` is inside
+
+    [ MARKET_OPEN_TIME (default 09:15) , 23:59 )
+
+so an end-of-day job at 17:00 IST still pulls the full day's candles,
+and a late-evening retry up to 23:59 is allowed. Before 09:15 the
+market has not opened yet (no candles for today); from 00:00 the
+previous day is already covered by the historical fetch.
+
+``INTRADAY_TEST_MODE=true`` remains as an escape hatch for manual runs
+outside the window (e.g. weekend verification).
 """
 
 from __future__ import annotations
@@ -31,6 +46,9 @@ from candle_backup.logger import get_logger
 from candle_backup.upstox_fetcher import fetch_historical, fetch_intraday
 
 logger = get_logger(__name__)
+
+# End of the intraday fetch window, exclusive. 23:59 in MARKET_TIMEZONE.
+_INTRADAY_WINDOW_END = dt_time(23, 59)
 
 
 def _parse_hhmm(value: str) -> dt_time:
@@ -74,7 +92,7 @@ class HistoricalCandleStore:
         self.ema_failed_count = 0
 
     # ------------------------------------------------------------------ #
-    # Market hours                                                        #
+    # Time helpers                                                        #
     # ------------------------------------------------------------------ #
     def _now_market_tz(self) -> datetime:
         try:
@@ -88,12 +106,28 @@ class HistoricalCandleStore:
         return datetime.now(tz)
 
     def is_market_hours(self) -> bool:
+        """True when now is inside the exchange trading session."""
         now = self._now_market_tz()
         if now.weekday() >= 5:
             return False
         open_t = _parse_hhmm(settings.market_open_time)
         close_t = _parse_hhmm(settings.market_close_time)
         return open_t <= now.time() <= close_t
+
+    def _intraday_window_open(self, now: datetime | None = None) -> bool:
+        """True when the intraday fetch is allowed to run.
+
+        Window is ``MARKET_OPEN_TIME`` (default 09:15) inclusive up to
+        ``23:59`` exclusive, evaluated in ``MARKET_TIMEZONE``. This is
+        wider than ``is_market_hours()`` on purpose so an end-of-day
+        job at 17:00 IST still pulls the complete trading day. The
+        day-of-week is intentionally not checked here — Upstox simply
+        returns nothing on non-trading days, and we want the same code
+        path to run on weekends during manual verification.
+        """
+        now = now or self._now_market_tz()
+        start = _parse_hhmm(settings.market_open_time)
+        return start <= now.time() < _INTRADAY_WINDOW_END
 
     # ------------------------------------------------------------------ #
     # Top-level orchestrator                                              #
@@ -240,14 +274,18 @@ class HistoricalCandleStore:
     ) -> dict[str, Any]:
         async with self._lock:
             now_local = self._now_market_tz()
-            if not self.is_market_hours() and not settings.intraday_test_mode:
+            window_open = self._intraday_window_open(now_local)
+
+            # Skip only when we are outside the [09:15, 23:59) window
+            # AND the manual override is off. Inside the window the
+            # fetch is mandatory regardless of INTRADAY_TEST_MODE.
+            if not window_open and not settings.intraday_test_mode:
                 summary = {
                     "reason": reason,
                     "skipped": True,
                     "skip_reason": (
-                        "outside market hours "
-                        f"({settings.market_open_time}-"
-                        f"{settings.market_close_time} "
+                        "outside intraday window "
+                        f"({settings.market_open_time}-23:59 "
                         f"{settings.market_timezone})"
                     ),
                     "now_market_tz": now_local.isoformat(),
@@ -256,10 +294,16 @@ class HistoricalCandleStore:
                 logger.info("Intraday candle job skipped; %s", summary)
                 return summary
 
-            if settings.intraday_test_mode and not self.is_market_hours():
+            if window_open and not self.is_market_hours():
+                logger.info(
+                    "Intraday candle job running outside market hours "
+                    "but inside the 09:15-23:59 window; now=%s",
+                    now_local.isoformat(),
+                )
+            elif settings.intraday_test_mode and not window_open:
                 logger.info(
                     "Intraday candle job running in TEST MODE; "
-                    "market-hours gate bypassed; now=%s",
+                    "window gate bypassed; now=%s",
                     now_local.isoformat(),
                 )
 
@@ -290,6 +334,7 @@ class HistoricalCandleStore:
                 "reason": reason,
                 "skipped": False,
                 "test_mode": settings.intraday_test_mode,
+                "window_open": window_open,
                 "total": self._intraday_total_count,
                 "processed": self._intraday_processed_count,
                 "updated": self.intraday_updated_count,
