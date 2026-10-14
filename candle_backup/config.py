@@ -38,6 +38,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     # ---- HTTP ---------------------------------------------------------
@@ -91,6 +101,26 @@ class Settings:
     ema_fast_period: int = int(os.getenv("EMA_FAST_PERIOD", "9"))
     ema_slow_period: int = int(os.getenv("EMA_SLOW_PERIOD", "21"))
 
+    # ---- EMA validation (cross scoring) -------------------------------
+    ema_enable_validation: bool = _env_bool("EMA_ENABLE_VALIDATION", True)
+    ema_min_validation_score: int = _env_int("EMA_MIN_VALIDATION_SCORE", 3)
+
+    ema_use_trend_filter: bool = _env_bool("EMA_USE_TREND_FILTER", True)
+    ema_use_separation_filter: bool = _env_bool("EMA_USE_SEPARATION_FILTER", True)
+    ema_use_slope_filter: bool = _env_bool("EMA_USE_SLOPE_FILTER", True)
+    ema_use_volume_filter: bool = _env_bool("EMA_USE_VOLUME_FILTER", True)
+    ema_use_body_filter: bool = _env_bool("EMA_USE_BODY_FILTER", True)
+    ema_use_distance_filter: bool = _env_bool("EMA_USE_DISTANCE_FILTER", True)
+
+    ema_trend_fast_period: int = _env_int("EMA_TREND_FAST_PERIOD", 50)
+    ema_trend_slow_period: int = _env_int("EMA_TREND_SLOW_PERIOD", 100)
+    ema_atr_period: int = _env_int("EMA_ATR_PERIOD", 14)
+    ema_sep_atr_min: float = _env_float("EMA_SEP_ATR_MIN", 0.15)
+    ema_slope_lookback: int = _env_int("EMA_SLOPE_LOOKBACK", 3)
+    ema_volume_lookback: int = _env_int("EMA_VOLUME_LOOKBACK", 20)
+    ema_volume_mult: float = _env_float("EMA_VOLUME_MULT", 1.0)
+    ema_distance_atr_max: float = _env_float("EMA_DISTANCE_ATR_MAX", 1.5)
+
     # ---- MEGA backup --------------------------------------------------
     mega_enabled: bool = _env_bool("MEGA_ENABLED", True)
     mega_email: str = _env_str("MEGA_EMAIL", "")
@@ -126,5 +156,14 @@ class Settings:
     mongo_max_blob_mb: int = int(os.getenv("MONGO_MAX_BLOB_MB", "15"))
     mongo_timeout_ms: int = int(os.getenv("MONGO_TIMEOUT_MS", "10000"))
 
+    # ---- Upstox SDK per-request timeouts ------------------------------
+    # Per-request read timeout for every HistoryV3 SDK call. A single
+    # slow upstream response can no longer stall the whole backup run.
+    upstox_request_timeout_seconds: float = _env_float(
+        "UPSTOX_REQUEST_TIMEOUT_SECONDS", 60.0
+    )
+    upstox_connect_timeout_seconds: float = _env_float(
+        "UPSTOX_CONNECT_TIMEOUT_SECONDS", 10.0
+    )
 
 settings = Settings()

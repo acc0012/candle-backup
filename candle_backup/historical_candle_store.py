@@ -2,7 +2,7 @@
 
 Job A — ``ensure_recent_candles`` (historical, last N days)
 Job B — ``ensure_intraday_candles`` (today only)
-Job C — ``compute_ema_crosses`` (writes ema_crosses.json)
+Job C — ``compute_ema_crosses`` (writes ema_crosses.json with rich fields)
 
 The three jobs write into the same per-instrument directory:
 
@@ -10,21 +10,6 @@ The three jobs write into the same per-instrument directory:
     data/<underlying>/<strike>_<type>/ema_crosses.json
 
 ``ensure_candles_and_emas`` runs all three in order.
-
-Intraday window
----------------
-The intraday fetch is **time-window gated**, not market-hours gated.
-It runs whenever the current time in ``MARKET_TIMEZONE`` is inside
-
-    [ MARKET_OPEN_TIME (default 09:15) , 23:59 )
-
-so an end-of-day job at 17:00 IST still pulls the full day's candles,
-and a late-evening retry up to 23:59 is allowed. Before 09:15 the
-market has not opened yet (no candles for today); from 00:00 the
-previous day is already covered by the historical fetch.
-
-``INTRADAY_TEST_MODE=true`` remains as an escape hatch for manual runs
-outside the window (e.g. weekend verification).
 """
 
 from __future__ import annotations
@@ -37,7 +22,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from candle_backup.config import settings
-from candle_backup.ema import detect_crosses
+from candle_backup.ema import EmaValidationConfig, detect_crosses
 from candle_backup.instrument_paths import (
     build_candle_path,
     build_ema_path,
@@ -47,7 +32,6 @@ from candle_backup.upstox_fetcher import fetch_historical, fetch_intraday
 
 logger = get_logger(__name__)
 
-# End of the intraday fetch window, exclusive. 23:59 in MARKET_TIMEZONE.
 _INTRADAY_WINDOW_END = dt_time(23, 59)
 
 
@@ -61,7 +45,6 @@ def _parse_hhmm(value: str) -> dt_time:
 
 
 def _json_default(obj: Any) -> str:
-    """Fallback serializer for datetimes/dates and anything else."""
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     return str(obj)
@@ -89,6 +72,7 @@ class HistoricalCandleStore:
         # EMA state.
         self.ema_files_written = 0
         self.ema_total_crosses = 0
+        self.ema_valid_crosses = 0
         self.ema_failed_count = 0
 
     # ------------------------------------------------------------------ #
@@ -106,7 +90,6 @@ class HistoricalCandleStore:
         return datetime.now(tz)
 
     def is_market_hours(self) -> bool:
-        """True when now is inside the exchange trading session."""
         now = self._now_market_tz()
         if now.weekday() >= 5:
             return False
@@ -115,16 +98,6 @@ class HistoricalCandleStore:
         return open_t <= now.time() <= close_t
 
     def _intraday_window_open(self, now: datetime | None = None) -> bool:
-        """True when the intraday fetch is allowed to run.
-
-        Window is ``MARKET_OPEN_TIME`` (default 09:15) inclusive up to
-        ``23:59`` exclusive, evaluated in ``MARKET_TIMEZONE``. This is
-        wider than ``is_market_hours()`` on purpose so an end-of-day
-        job at 17:00 IST still pulls the complete trading day. The
-        day-of-week is intentionally not checked here — Upstox simply
-        returns nothing on non-trading days, and we want the same code
-        path to run on weekends during manual verification.
-        """
         now = now or self._now_market_tz()
         start = _parse_hhmm(settings.market_open_time)
         return start <= now.time() < _INTRADAY_WINDOW_END
@@ -276,9 +249,6 @@ class HistoricalCandleStore:
             now_local = self._now_market_tz()
             window_open = self._intraday_window_open(now_local)
 
-            # Skip only when we are outside the [09:15, 23:59) window
-            # AND the manual override is off. Inside the window the
-            # fetch is mandatory regardless of INTRADAY_TEST_MODE.
             if not window_open and not settings.intraday_test_mode:
                 summary = {
                     "reason": reason,
@@ -384,19 +354,39 @@ class HistoricalCandleStore:
         self._intraday_processed_count += 1
 
     # ------------------------------------------------------------------ #
-    # EMA crosses                                                         #
+    # EMA crosses (with rich per-cross scoring)                           #
     # ------------------------------------------------------------------ #
     def compute_ema_crosses(
         self,
         instruments: list[dict[str, Any]],
         reason: str = "backup",
     ) -> dict[str, Any]:
-        """Load each candle file, detect EMA crosses, write ema_crosses.json."""
+        """Load each candle file, detect scored EMA crosses, write ema_crosses.json."""
         fast = settings.ema_fast_period
         slow = settings.ema_slow_period
 
+        cfg = EmaValidationConfig(
+            enable_validation=settings.ema_enable_validation,
+            min_validation_score=settings.ema_min_validation_score,
+            use_trend_filter=settings.ema_use_trend_filter,
+            use_separation_filter=settings.ema_use_separation_filter,
+            use_slope_filter=settings.ema_use_slope_filter,
+            use_volume_filter=settings.ema_use_volume_filter,
+            use_body_filter=settings.ema_use_body_filter,
+            use_distance_filter=settings.ema_use_distance_filter,
+            trend_fast_period=settings.ema_trend_fast_period,
+            trend_slow_period=settings.ema_trend_slow_period,
+            atr_period=settings.ema_atr_period,
+            sep_atr_min=settings.ema_sep_atr_min,
+            slope_lookback=settings.ema_slope_lookback,
+            volume_lookback=settings.ema_volume_lookback,
+            volume_mult=settings.ema_volume_mult,
+            distance_atr_max=settings.ema_distance_atr_max,
+        )
+
         self.ema_files_written = 0
         self.ema_total_crosses = 0
+        self.ema_valid_crosses = 0
         self.ema_failed_count = 0
 
         for item in instruments:
@@ -412,7 +402,7 @@ class HistoricalCandleStore:
                 continue
 
             try:
-                crosses = detect_crosses(candles, fast, slow)
+                crosses = detect_crosses(candles, fast, slow, validation=cfg)
             except Exception:
                 self.ema_failed_count += 1
                 logger.exception(
@@ -420,6 +410,8 @@ class HistoricalCandleStore:
                     instrument_key,
                 )
                 continue
+
+            valid_count = sum(1 for c in crosses if c.get("valid"))
 
             payload = {
                 "instrument_key": instrument_key,
@@ -433,6 +425,19 @@ class HistoricalCandleStore:
                 "slow_period": slow,
                 "candle_count": len(candles),
                 "cross_count": len(crosses),
+                "valid_cross_count": valid_count,
+                "validation": {
+                    "enabled": cfg.enable_validation,
+                    "min_score": cfg.min_validation_score,
+                    "filters": {
+                        "trend": cfg.use_trend_filter,
+                        "separation": cfg.use_separation_filter,
+                        "slope": cfg.use_slope_filter,
+                        "volume": cfg.use_volume_filter,
+                        "body": cfg.use_body_filter,
+                        "distance": cfg.use_distance_filter,
+                    },
+                },
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "crosses": crosses,
             }
@@ -440,6 +445,7 @@ class HistoricalCandleStore:
                 self._save_ema(build_ema_path(item), payload)
                 self.ema_files_written += 1
                 self.ema_total_crosses += len(crosses)
+                self.ema_valid_crosses += valid_count
             except Exception:
                 self.ema_failed_count += 1
                 logger.exception(
@@ -454,6 +460,7 @@ class HistoricalCandleStore:
             "slow_period": slow,
             "files_written": self.ema_files_written,
             "total_crosses": self.ema_total_crosses,
+            "valid_crosses": self.ema_valid_crosses,
             "failed": self.ema_failed_count,
         }
         logger.info("EMA cross job completed; %s", summary)
