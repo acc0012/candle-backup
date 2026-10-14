@@ -67,7 +67,7 @@ class Settings:
     market_timezone: str = os.getenv("MARKET_TIMEZONE", "Asia/Kolkata")
     market_open_time: str = os.getenv("MARKET_OPEN_TIME", "09:15")
     market_close_time: str = os.getenv("MARKET_CLOSE_TIME", "15:40")
-    intraday_test_mode: bool = _env_bool("INTRADAY_TEST_MODE", False)
+    intraday_test_mode: bool = _env_bool("INTRADAY_TEST_MODE", True)
 
     # ---- Instrument archive (free, no auth) ---------------------------
     instruments_url: str = _env_str(

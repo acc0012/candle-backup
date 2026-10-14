@@ -20,8 +20,8 @@ on:
         default: "manual"
       intraday_test_mode:
         description: "Run the intraday fetch outside market hours? (true/false)"
-        required: false
-        default: "false"
+        required: true
+        default: "true"
 
 concurrency:
   group: candle-backup
