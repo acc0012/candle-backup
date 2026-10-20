@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mega_sdk import Mega
+
 from candle_backup.config import settings
 from candle_backup.logger import get_logger
 

@@ -1,6 +1,22 @@
-python-dotenv
+# HTTP / networking
 requests
+
+# Environment
+python-dotenv
+
+# Upstox market data
 upstox-python-sdk
+
+# Timezone data (needed for zoneinfo on Windows + slim Linux images)
 tzdata
+
+# MongoDB (optional backup metadata / blob storage)
 pymongo
-mega-sdk
+
+# MEGA cloud backup client
+# 0.1.0 shipped an empty wheel (dist-info only, ~2.6 KB) due to a
+# packaging layout bug upstream. 0.1.1 is the fixed release (~14 KB,
+# contains mega_sdk/{__init__,crypto,errors,mega}.py).
+# The >=0.1.1 floor prevents pip from ever resolving back to the
+# broken 0.1.0 in a clean environment.
+mega-sdk>=0.1.1
