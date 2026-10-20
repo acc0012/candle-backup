@@ -1,6 +1,7 @@
 """Upload the local candle cache to MEGA as a single zip archive.
 
-Uses the vendored ``mega_local`` package — no external MEGA SDK.
+Uses the published ``mega-sdk`` package (``pip install mega-sdk``) —
+no vendored MEGA code lives in this repo.
 
 Design
 ------
@@ -31,19 +32,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from mega_local import Mega
-
+from mega_sdk import Mega
 from candle_backup.config import settings
 from candle_backup.logger import get_logger
 
 logger = get_logger(__name__)
 
-
 # A hook invoked after a successful upload but before the temp archive
 # is deleted. Receives (archive_path, summary) — the path is valid for
 # the duration of the call only.
 PostUploadHook = Callable[[Path, dict[str, Any]], None]
-
 
 # ---------------------------------------------------------------------------
 # Internals
@@ -61,7 +59,6 @@ def _login() -> Mega:
     mega.get_files()  # primes mega.root_id
     return mega
 
-
 def _find_child_by_name(
     files: dict[str, Any], parent_id: str, name: str
 ) -> str | None:
@@ -72,7 +69,6 @@ def _find_child_by_name(
         if attribs.get("n") == name:
             return handle
     return None
-
 
 def _delete_remote_folder(mega: Mega, node_id: str) -> None:
     """Permanently remove a MEGA folder and its children."""
@@ -87,10 +83,8 @@ def _delete_remote_folder(mega: Mega, node_id: str) -> None:
         mega.delete(node_id)
         mega.empty_trash()
 
-
 def _count_files(root: Path) -> int:
     return sum(1 for p in root.rglob("*") if p.is_file())
-
 
 def _write_manifest(
     data_dir: Path,
@@ -105,7 +99,6 @@ def _write_manifest(
         f"data_dir={data_dir.name}\n"
         f"file_count={file_count}\n"
     )
-
 
 def _build_archive(
     data_dir: Path,
@@ -147,7 +140,6 @@ def _build_archive(
 
     return archive_path
 
-
 def _get_uploaded_file_link(
     mega: Mega,
     folder_id: str,
@@ -175,10 +167,8 @@ def _get_uploaded_file_link(
             return None
     return None
 
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 # ---------------------------------------------------------------------------
 # Public API
