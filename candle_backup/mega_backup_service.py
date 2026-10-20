@@ -280,5 +280,4 @@ def backup_to_mega(
                     logger.exception("post_upload callback failed")
 
     summary["completed_at"] = _now_iso()
-    logger.info("Backup summary: %s", summary)
     return summary
