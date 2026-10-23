@@ -50,8 +50,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_path(name: str, default: Path) -> Path:
-    """Path env var: ``None``/blank -> default; absolute -> as-is; relative
-    -> resolved against ``BASE_DIR`` so it is stable regardless of CWD."""
+    """Path env var: blank -> default; absolute -> as-is; relative ->
+    resolved against ``BASE_DIR`` so it is stable regardless of CWD."""
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
@@ -103,17 +103,19 @@ class Settings:
     )
 
     # ---- All-instruments snapshot file --------------------------------
-    # Written after every discover_instruments() run. Keyed by
+    # Written after every discover_instruments() run, keyed by
     # instrument_key with expiry already converted to a readable date.
-    # Default: <BASE_DIR.parent>/mega_archive_service/storage/mega/all_instruments.json
+    #
+    # Default: <DATA_DIR>/all_instruments.json
+    #   -> "data/all_instruments.json" with the default DATA_DIR=data.
+    # Because it lives inside data/, it is automatically included in
+    # the MEGA backup zip and shows up as "all_instruments.json" at
+    # the archive root.
+    #
     # Override via ALL_INSTRUMENTS_FILE (absolute or BASE_DIR-relative).
     all_instruments_file: Path = _env_path(
         "ALL_INSTRUMENTS_FILE",
-        BASE_DIR.parent
-        / "mega_archive_service"
-        / "storage"
-        / "mega"
-        / "all_instruments.json",
+        BASE_DIR / os.getenv("DATA_DIR", "data") / "all_instruments.json",
     )
 
     # ---- Underlyings to back up (option chains) -----------------------
@@ -147,9 +149,6 @@ class Settings:
 
     # Time (HH:MM IST) that separates "use first candle" from "use last
     # candle" when picking the reference close for the strike window.
-    #
-    #   09:15 <= now < 10:00  -> first candle of today
-    #   10:00 <= now < 23:59  -> last  candle of today
     strike_range_mode_cutoff_time: str = _env_str(
         "STRIKE_RANGE_MODE_CUTOFF_TIME", "10:00"
     )

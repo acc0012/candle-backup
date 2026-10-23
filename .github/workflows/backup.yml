@@ -57,6 +57,7 @@ jobs:
           MEGA_BACKUP_FOLDER_OVERRIDE: ${{ vars.MEGA_BACKUP_FOLDER }}
           MONGO_DB_NAME_OVERRIDE: ${{ vars.MONGO_DB_NAME }}
           MONGO_MAX_BLOB_MB_OVERRIDE: ${{ vars.MONGO_MAX_BLOB_MB }}
+          # Optional override — leave unset to use data/all_instruments.json
           ALL_INSTRUMENTS_FILE_OVERRIDE: ${{ vars.ALL_INSTRUMENTS_FILE }}
           NIFTY_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.NIFTY_STRIKE_RANGE_POINTS }}
           SENSEX_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.SENSEX_STRIKE_RANGE_POINTS }}
@@ -175,7 +176,7 @@ jobs:
           if [ -n "${ALL_INSTRUMENTS_FILE_OVERRIDE}" ]; then
             echo "ALL_INSTRUMENTS_FILE=${ALL_INSTRUMENTS_FILE_OVERRIDE}"
           else
-            echo "ALL_INSTRUMENTS_FILE=default (<BASE_DIR.parent>/mega_archive_service/storage/mega/all_instruments.json)"
+            echo "ALL_INSTRUMENTS_FILE=default (<DATA_DIR>/all_instruments.json = data/all_instruments.json)"
           fi
 
       - name: Fetch candles and upload to MEGA
@@ -194,17 +195,19 @@ jobs:
           ls -R data/index 2>/dev/null | head -50 || true
           echo "Options folders:"
           ls -R data/nifty data/sensex 2>/dev/null | head -50 || true
+          echo "all_instruments.json (inside data/):"
+          ls -la data/all_instruments.json 2>/dev/null || echo "(not written this run)"
 
       - name: Verify all_instruments.json
         if: always()
         run: |
-          echo "all_instruments.json:"
-          ALL_JSON="../mega_archive_service/storage/mega/all_instruments.json"
+          ALL_JSON="data/all_instruments.json"
+          echo "Verifying ${ALL_JSON}:"
           ls -la "$ALL_JSON" 2>/dev/null || echo "(not written this run)"
           if [ -f "$ALL_JSON" ]; then
             python - <<'PY'
           import json, sys
-          p = "../mega_archive_service/storage/mega/all_instruments.json"
+          p = "data/all_instruments.json"
           try:
               data = json.load(open(p, encoding="utf-8"))
           except Exception as e:
@@ -220,7 +223,6 @@ jobs:
                     "(no option contracts). Check the STRIKE-RANGE fallbacks.")
           else:
               print("OK — all_instruments.json contains option contracts.")
-          # Print a small sample
           for i, (k, v) in enumerate(list(data.items())[:5]):
               print(f"  sample[{i}] {k} -> {v.get('strike_type')} "
                     f"expiry={v.get('expiry')}")
