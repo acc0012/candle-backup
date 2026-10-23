@@ -14,9 +14,14 @@ Returned instruments include two categories:
    ``BSE_INDEX|SENSEX`` by default) so their candle/EMA series are backed
    up under ``data/index/<name>/``.
 2. The nearest-expiry CE/PE options per underlying, filtered to a
-   **dynamic strike window** derived from the index's first intraday
-   candle (see ``strike_range_service``). When that computation fails
-   the static ``*_STRIKE_MIN/MAX`` settings are used as a fallback.
+   **dynamic strike window** derived from the index's intraday candles
+   (see ``strike_range_service``). When that computation fails the static
+   ``*_STRIKE_MIN/MAX`` settings are used as a fallback.
+
+Every successful discovery run also writes a snapshot of the final
+instrument list to ``settings.all_instruments_file`` (default
+``<BASE_DIR.parent>/mega_archive_service/storage/mega/all_instruments.json``)
+via ``all_instruments_service.save_all_instruments``.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from candle_backup.all_instruments_service import save_all_instruments
 from candle_backup.config import settings
 from candle_backup.logger import get_logger
 from candle_backup.strike_range_service import compute_dynamic_strike_ranges
@@ -294,6 +300,7 @@ def _build_index_rows() -> list[dict[str, Any]]:
                 "instrument_key": key,
                 "underlying_symbol": symbol,
                 "instrument_type": "INDEX",
+                "trading_symbol": symbol,
             }
         )
     return rows
@@ -307,6 +314,8 @@ def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
 
     Returns the main index rows plus the nearest-expiry, dynamically
     strike-filtered option contracts for every configured underlying.
+    Also writes an ``all_instruments.json`` snapshot keyed by
+    ``instrument_key`` (see ``all_instruments_service``).
     """
     archive = download_instruments(force=force_download)
 
@@ -352,8 +361,18 @@ def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
     # ---- Index rows --------------------------------------------------
     indices = _build_index_rows()
 
+    combined = indices + options
     logger.info(
         "Discovered %d instrument(s): %d index rows + %d option contracts",
-        len(indices) + len(options), len(indices), len(options),
+        len(combined), len(indices), len(options),
     )
-    return indices + options
+
+    # ---- all_instruments.json snapshot -------------------------------
+    try:
+        save_all_instruments(combined)
+    except Exception:
+        logger.exception(
+            "all_instruments.json write failed; continuing with backup",
+        )
+
+    return combined

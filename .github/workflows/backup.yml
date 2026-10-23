@@ -9,8 +9,6 @@ on:
 
   schedule:
     # 17:00 IST (Asia/Kolkata) every day.
-    # GitHub Actions cron is UTC; IST = UTC+05:30, so
-    #   17:00 IST  ==  11:30 UTC the same calendar day.
     - cron: "30 11 * * *"
 
   workflow_dispatch:
@@ -62,12 +60,12 @@ jobs:
           MEGA_BACKUP_FOLDER_OVERRIDE: ${{ vars.MEGA_BACKUP_FOLDER }}
           MONGO_DB_NAME_OVERRIDE: ${{ vars.MONGO_DB_NAME }}
           MONGO_MAX_BLOB_MB_OVERRIDE: ${{ vars.MONGO_MAX_BLOB_MB }}
+          ALL_INSTRUMENTS_FILE_OVERRIDE: ${{ vars.ALL_INSTRUMENTS_FILE }}
           # Dynamic strike-range tuning
           NIFTY_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.NIFTY_STRIKE_RANGE_POINTS }}
           SENSEX_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.SENSEX_STRIKE_RANGE_POINTS }}
           NIFTY_STRIKE_ROUNDING_OVERRIDE: ${{ vars.NIFTY_STRIKE_ROUNDING }}
           SENSEX_STRIKE_ROUNDING_OVERRIDE: ${{ vars.SENSEX_STRIKE_ROUNDING }}
-          # Time (HH:MM IST) splitting first-candle vs last-candle windows
           STRIKE_RANGE_MODE_CUTOFF_TIME_OVERRIDE: ${{ vars.STRIKE_RANGE_MODE_CUTOFF_TIME }}
           # Static fallback strike ranges
           NIFTY_STRIKE_MIN_OVERRIDE: ${{ vars.NIFTY_STRIKE_MIN }}
@@ -87,13 +85,19 @@ jobs:
           MONGO_DB_NAME="${MONGO_DB_NAME_OVERRIDE:-UPSTOX_APP_V2}"
           MONGO_MAX_BLOB_MB="${MONGO_MAX_BLOB_MB_OVERRIDE:-15}"
 
+          # Optional: override the all_instruments.json path.
+          # If unset, the Python default is used:
+          #   <BASE_DIR.parent>/mega_archive_service/storage/mega/all_instruments.json
+          ALL_INSTRUMENTS_LINE=""
+          if [ -n "${ALL_INSTRUMENTS_FILE_OVERRIDE}" ]; then
+            ALL_INSTRUMENTS_LINE="ALL_INSTRUMENTS_FILE=${ALL_INSTRUMENTS_FILE_OVERRIDE}"
+          fi
+
           # Dynamic strike-range tuning
           NIFTY_STRIKE_RANGE_POINTS="${NIFTY_STRIKE_RANGE_POINTS_OVERRIDE:-500}"
           SENSEX_STRIKE_RANGE_POINTS="${SENSEX_STRIKE_RANGE_POINTS_OVERRIDE:-1000}"
           NIFTY_STRIKE_ROUNDING="${NIFTY_STRIKE_ROUNDING_OVERRIDE:-50}"
           SENSEX_STRIKE_ROUNDING="${SENSEX_STRIKE_ROUNDING_OVERRIDE:-100}"
-
-          # Time window cutover (default 10:00 IST)
           STRIKE_RANGE_MODE_CUTOFF_TIME="${STRIKE_RANGE_MODE_CUTOFF_TIME_OVERRIDE:-10:00}"
 
           # Static fallback strike ranges
@@ -134,6 +138,7 @@ jobs:
           INTRADAY_TEST_MODE=${INTRADAY_TEST_MODE}
           INSTRUMENTS_URL=https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz
           INSTRUMENTS_CACHE_DIR=data/_cache
+          ${ALL_INSTRUMENTS_LINE}
           NIFTY_UNDERLYING=NIFTY
           SENSEX_UNDERLYING=SENSEX
           NIFTY_INDEX_INSTRUMENT_KEY=NSE_INDEX|Nifty 50
@@ -179,6 +184,11 @@ jobs:
           echo "TELEGRAM_ENABLED=${TELEGRAM_ENABLED}"
           echo "MONGO_ENABLED=${MONGO_ENABLED}"
           echo "MONGO_DB_NAME=${MONGO_DB_NAME}"
+          if [ -n "${ALL_INSTRUMENTS_FILE_OVERRIDE}" ]; then
+            echo "ALL_INSTRUMENTS_FILE=${ALL_INSTRUMENTS_FILE_OVERRIDE}"
+          else
+            echo "ALL_INSTRUMENTS_FILE=default (<BASE_DIR.parent>/mega_archive_service/storage/mega/all_instruments.json)"
+          fi
 
       - name: Fetch candles and upload to MEGA
         run: python -m candle_backup
@@ -196,6 +206,10 @@ jobs:
           ls -R data/index 2>/dev/null | head -50 || true
           echo "Options folders:"
           ls -R data/nifty data/sensex 2>/dev/null | head -50 || true
+          echo "all_instruments.json:"
+          ls -la ../mega_archive_service/storage/mega/all_instruments.json 2>/dev/null \
+            && head -40 ../mega_archive_service/storage/mega/all_instruments.json 2>/dev/null \
+            || echo "(not written this run)"
 
       - name: Upload logs on failure
         if: failure()

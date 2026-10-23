@@ -49,6 +49,19 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_path(name: str, default: Path) -> Path:
+    """Path env var: ``None``/blank -> default; absolute -> as-is; relative
+    -> resolved against ``BASE_DIR`` so it is stable regardless of CWD."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().strip('"').strip("'")
+    p = Path(value)
+    if not p.is_absolute():
+        p = (BASE_DIR / p).resolve()
+    return p
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     # ---- HTTP ---------------------------------------------------------
@@ -87,6 +100,20 @@ class Settings:
     )
     instruments_cache_dir: Path = BASE_DIR / os.getenv(
         "INSTRUMENTS_CACHE_DIR", "data/_cache"
+    )
+
+    # ---- All-instruments snapshot file --------------------------------
+    # Written after every discover_instruments() run. Keyed by
+    # instrument_key with expiry already converted to a readable date.
+    # Default: <BASE_DIR.parent>/mega_archive_service/storage/mega/all_instruments.json
+    # Override via ALL_INSTRUMENTS_FILE (absolute or BASE_DIR-relative).
+    all_instruments_file: Path = _env_path(
+        "ALL_INSTRUMENTS_FILE",
+        BASE_DIR.parent
+        / "mega_archive_service"
+        / "storage"
+        / "mega"
+        / "all_instruments.json",
     )
 
     # ---- Underlyings to back up (option chains) -----------------------
