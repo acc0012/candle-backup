@@ -51,6 +51,7 @@ venv/
 myenv/
 *.egg-info/
 build/
+project_structure.txt
 dist/
 files.txt
 combined_output.txt

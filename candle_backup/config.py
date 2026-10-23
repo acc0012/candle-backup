@@ -1,3 +1,4 @@
+# candle_backup/config.py
 """Configuration loaded from .env or the process environment."""
 
 from __future__ import annotations
@@ -92,10 +93,45 @@ class Settings:
     nifty_underlying: str = _env_str("NIFTY_UNDERLYING", "NIFTY")
     sensex_underlying: str = _env_str("SENSEX_UNDERLYING", "SENSEX")
 
+    # Main index instrument keys — fetched intraday to derive the
+    # dynamic strike window, and backed up under data/index/<name>/.
+    nifty_index_instrument_key: str = _env_str(
+        "NIFTY_INDEX_INSTRUMENT_KEY", "NSE_INDEX|Nifty 50"
+    )
+    sensex_index_instrument_key: str = _env_str(
+        "SENSEX_INDEX_INSTRUMENT_KEY", "BSE_INDEX|SENSEX"
+    )
+
+    # ---- Dynamic strike ranges ---------------------------------------
+    # NIFTY:   ±500 pts, rounded to 50
+    # SENSEX:  ±1000 pts, rounded to 100
+    nifty_strike_range_points: float = _env_float(
+        "NIFTY_STRIKE_RANGE_POINTS", 500.0
+    )
+    sensex_strike_range_points: float = _env_float(
+        "SENSEX_STRIKE_RANGE_POINTS", 1000.0
+    )
+    nifty_strike_rounding: float = _env_float(
+        "NIFTY_STRIKE_ROUNDING", 50.0
+    )
+    sensex_strike_rounding: float = _env_float(
+        "SENSEX_STRIKE_ROUNDING", 100.0
+    )
+
+    # Time (HH:MM IST) that separates "use first candle" from "use last
+    # candle" when picking the reference close for the strike window.
+    #
+    #   09:15 <= now < 10:00  -> first candle of today
+    #   10:00 <= now < 23:59  -> last  candle of today
+    strike_range_mode_cutoff_time: str = _env_str(
+        "STRIKE_RANGE_MODE_CUTOFF_TIME", "10:00"
+    )
+
+    # Static fallbacks — only used when the dynamic computation fails.
     nifty_strike_min: float = _env_float("NIFTY_STRIKE_MIN", 21000.0)
     nifty_strike_max: float = _env_float("NIFTY_STRIKE_MAX", 26000.0)
     sensex_strike_min: float = _env_float("SENSEX_STRIKE_MIN", 71000.0)
-    sensex_strike_max: float = _env_float("SENSEX_STRIKE_MAX", 71000.0)
+    sensex_strike_max: float = _env_float("SENSEX_STRIKE_MAX", 73000.0)
 
     # ---- EMA / crosses ------------------------------------------------
     ema_fast_period: int = int(os.getenv("EMA_FAST_PERIOD", "9"))
@@ -157,13 +193,12 @@ class Settings:
     mongo_timeout_ms: int = int(os.getenv("MONGO_TIMEOUT_MS", "10000"))
 
     # ---- Upstox SDK per-request timeouts ------------------------------
-    # Per-request read timeout for every HistoryV3 SDK call. A single
-    # slow upstream response can no longer stall the whole backup run.
     upstox_request_timeout_seconds: float = _env_float(
         "UPSTOX_REQUEST_TIMEOUT_SECONDS", 60.0
     )
     upstox_connect_timeout_seconds: float = _env_float(
         "UPSTOX_CONNECT_TIMEOUT_SECONDS", 10.0
     )
+
 
 settings = Settings()

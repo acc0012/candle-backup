@@ -1,3 +1,4 @@
+# candle_backup/instruments_service.py
 """Discover option instruments from Upstox's free public archive.
 
 Downloads:
@@ -7,9 +8,15 @@ Downloads:
 The archive is cached on disk per-day so repeated runs don't re-download.
 No authentication is required.
 
-The returned instrument list is already reduced to the *nearest expiry*
-per underlying and filtered by strike range and CE/PE, so downstream
-stages (candle fetch, EMA computation) can consume it directly.
+Returned instruments include two categories:
+
+1. The main index rows themselves (``NSE_INDEX|Nifty 50`` and
+   ``BSE_INDEX|SENSEX`` by default) so their candle/EMA series are backed
+   up under ``data/index/<name>/``.
+2. The nearest-expiry CE/PE options per underlying, filtered to a
+   **dynamic strike window** derived from the index's first intraday
+   candle (see ``strike_range_service``). When that computation fails
+   the static ``*_STRIKE_MIN/MAX`` settings are used as a fallback.
 """
 
 from __future__ import annotations
@@ -27,12 +34,12 @@ import requests
 
 from candle_backup.config import settings
 from candle_backup.logger import get_logger
+from candle_backup.strike_range_service import compute_dynamic_strike_ranges
 
 logger = get_logger(__name__)
 
 _MARKET_TZ = ZoneInfo("Asia/Kolkata")
 _DEFAULT_TYPES: tuple[str, ...] = ("CE", "PE")
-
 
 # ---------------------------------------------------------------------------
 # Download + cache
@@ -106,7 +113,6 @@ def download_instruments(force: bool = False) -> list[dict[str, Any]]:
         except Exception:
             pass
 
-
 # ---------------------------------------------------------------------------
 # Expiry parsing
 # ---------------------------------------------------------------------------
@@ -116,7 +122,6 @@ def _parse_expiry(value: Any) -> datetime | None:
     if value is None:
         return None
 
-    # Epoch seconds / milliseconds (typical for the archive).
     try:
         ts = float(value)
         if ts > 1e11:
@@ -143,7 +148,6 @@ def _parse_expiry(value: Any) -> datetime | None:
                 return None
     return None
 
-
 # ---------------------------------------------------------------------------
 # Underlying matching
 # ---------------------------------------------------------------------------
@@ -158,11 +162,6 @@ def _first_token(value: str) -> str:
 
 
 def _matches_underlying(item: dict[str, Any], target: str) -> bool:
-    """True if the item's underlying matches ``target`` (e.g. "NIFTY").
-
-    Matches against ``underlying_symbol``, ``name``, ``asset_symbol``,
-    ``underlying_key``. Both "NIFTY" and "NIFTY 50" match target "NIFTY".
-    """
     t_norm = _norm(target)
     t_head = _first_token(t_norm)
 
@@ -170,12 +169,10 @@ def _matches_underlying(item: dict[str, Any], target: str) -> bool:
         raw = _norm(item.get(key))
         if not raw:
             continue
-        # strip exchange prefix like "NSE INDEX NIFTY" -> handled by first-token
         head = _first_token(raw)
         if raw == t_norm or head == t_head:
             return True
     return False
-
 
 # ---------------------------------------------------------------------------
 # Filtering
@@ -215,6 +212,12 @@ def filter_nearest_expiry_options(
     for target in targets:
         smin, smax = strike_ranges.get(target, (float("-inf"), float("inf")))
         lo, hi = min(smin, smax), max(smin, smax)
+        if lo == hi:
+            logger.warning(
+                "Empty strike range for %s (lo==hi==%s); skipping",
+                target, lo,
+            )
+            continue
 
         candidates: list[tuple[datetime, dict[str, Any]]] = []
         for item in instruments:
@@ -241,7 +244,10 @@ def filter_nearest_expiry_options(
             candidates.append((exp, item))
 
         if not candidates:
-            logger.warning("No active options found for %s", target)
+            logger.warning(
+                "No active options found for %s in strike window [%s, %s]",
+                target, lo, hi,
+            )
             continue
 
         nearest = min(exp.date() for exp, _ in candidates)
@@ -266,25 +272,88 @@ def filter_nearest_expiry_options(
 
     return result
 
+# ---------------------------------------------------------------------------
+# Index rows
+# ---------------------------------------------------------------------------
+
+def _build_index_rows() -> list[dict[str, Any]]:
+    """Minimal index rows consumed directly by the candle/EMA pipeline.
+
+    Their ``instrument_key`` starts with ``NSE_INDEX|`` / ``BSE_INDEX|``
+    so ``instrument_paths`` routes them to ``data/index/<name>/``.
+    """
+    rows: list[dict[str, Any]] = []
+    for key, symbol in (
+        (settings.nifty_index_instrument_key, settings.nifty_underlying),
+        (settings.sensex_index_instrument_key, settings.sensex_underlying),
+    ):
+        if not key or not symbol:
+            continue
+        rows.append(
+            {
+                "instrument_key": key,
+                "underlying_symbol": symbol,
+                "instrument_type": "INDEX",
+            }
+        )
+    return rows
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
-    """Convenience wrapper: download archive, filter nearest-expiry options."""
+    """Download the archive and return the full instrument list to fetch.
+
+    Returns the main index rows plus the nearest-expiry, dynamically
+    strike-filtered option contracts for every configured underlying.
+    """
     archive = download_instruments(force=force_download)
 
-    strike_ranges: dict[str, tuple[float, float]] = {
-        settings.nifty_underlying.upper(): (
-            settings.nifty_strike_min,
-            settings.nifty_strike_max,
-        ),
-        settings.sensex_underlying.upper(): (
-            settings.sensex_strike_min,
-            settings.sensex_strike_max,
-        ),
-    }
-    underlyings = [settings.nifty_underlying, settings.sensex_underlying]
+    # ---- Dynamic strike ranges --------------------------------------
+    try:
+        dynamic = compute_dynamic_strike_ranges()
+    except Exception:
+        logger.exception(
+            "Dynamic strike range computation failed; "
+            "falling back to static values",
+        )
+        dynamic = {}
 
-    return filter_nearest_expiry_options(
+    nifty_range = dynamic.get(settings.nifty_underlying.upper())
+    if nifty_range is None:
+        nifty_range = (settings.nifty_strike_min, settings.nifty_strike_max)
+        logger.warning(
+            "Using static NIFTY strike range %s (dynamic unavailable)",
+            nifty_range,
+        )
+
+    sensex_range = dynamic.get(settings.sensex_underlying.upper())
+    if sensex_range is None:
+        sensex_range = (settings.sensex_strike_min, settings.sensex_strike_max)
+        logger.warning(
+            "Using static SENSEX strike range %s (dynamic unavailable)",
+            sensex_range,
+        )
+
+    strike_ranges: dict[str, tuple[float, float]] = {
+        settings.nifty_underlying.upper(): nifty_range,
+        settings.sensex_underlying.upper(): sensex_range,
+    }
+
+    # ---- Options -----------------------------------------------------
+    underlyings = [settings.nifty_underlying, settings.sensex_underlying]
+    options = filter_nearest_expiry_options(
         archive,
         underlying_symbols=underlyings,
         strike_ranges=strike_ranges,
     )
+
+    # ---- Index rows --------------------------------------------------
+    indices = _build_index_rows()
+
+    logger.info(
+        "Discovered %d instrument(s): %d index rows + %d option contracts",
+        len(indices) + len(options), len(indices), len(options),
+    )
+    return indices + options

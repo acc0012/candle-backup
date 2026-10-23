@@ -1,3 +1,4 @@
+# .github/workflows/backup.yml
 name: Backup candles to MEGA
 
 on:
@@ -61,10 +62,19 @@ jobs:
           MEGA_BACKUP_FOLDER_OVERRIDE: ${{ vars.MEGA_BACKUP_FOLDER }}
           MONGO_DB_NAME_OVERRIDE: ${{ vars.MONGO_DB_NAME }}
           MONGO_MAX_BLOB_MB_OVERRIDE: ${{ vars.MONGO_MAX_BLOB_MB }}
+          # Dynamic strike-range tuning
+          NIFTY_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.NIFTY_STRIKE_RANGE_POINTS }}
+          SENSEX_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.SENSEX_STRIKE_RANGE_POINTS }}
+          NIFTY_STRIKE_ROUNDING_OVERRIDE: ${{ vars.NIFTY_STRIKE_ROUNDING }}
+          SENSEX_STRIKE_ROUNDING_OVERRIDE: ${{ vars.SENSEX_STRIKE_ROUNDING }}
+          # Time (HH:MM IST) splitting first-candle vs last-candle windows
+          STRIKE_RANGE_MODE_CUTOFF_TIME_OVERRIDE: ${{ vars.STRIKE_RANGE_MODE_CUTOFF_TIME }}
+          # Static fallback strike ranges
           NIFTY_STRIKE_MIN_OVERRIDE: ${{ vars.NIFTY_STRIKE_MIN }}
           NIFTY_STRIKE_MAX_OVERRIDE: ${{ vars.NIFTY_STRIKE_MAX }}
           SENSEX_STRIKE_MIN_OVERRIDE: ${{ vars.SENSEX_STRIKE_MIN }}
           SENSEX_STRIKE_MAX_OVERRIDE: ${{ vars.SENSEX_STRIKE_MAX }}
+          # EMA periods
           EMA_FAST_PERIOD_OVERRIDE: ${{ vars.EMA_FAST_PERIOD }}
           EMA_SLOW_PERIOD_OVERRIDE: ${{ vars.EMA_SLOW_PERIOD }}
           # ---- Manual-run input -------------------------------------
@@ -76,10 +86,22 @@ jobs:
           MEGA_BACKUP_FOLDER="${MEGA_BACKUP_FOLDER_OVERRIDE:-novag7_candles_backup}"
           MONGO_DB_NAME="${MONGO_DB_NAME_OVERRIDE:-UPSTOX_APP_V2}"
           MONGO_MAX_BLOB_MB="${MONGO_MAX_BLOB_MB_OVERRIDE:-15}"
+
+          # Dynamic strike-range tuning
+          NIFTY_STRIKE_RANGE_POINTS="${NIFTY_STRIKE_RANGE_POINTS_OVERRIDE:-500}"
+          SENSEX_STRIKE_RANGE_POINTS="${SENSEX_STRIKE_RANGE_POINTS_OVERRIDE:-1000}"
+          NIFTY_STRIKE_ROUNDING="${NIFTY_STRIKE_ROUNDING_OVERRIDE:-50}"
+          SENSEX_STRIKE_ROUNDING="${SENSEX_STRIKE_ROUNDING_OVERRIDE:-100}"
+
+          # Time window cutover (default 10:00 IST)
+          STRIKE_RANGE_MODE_CUTOFF_TIME="${STRIKE_RANGE_MODE_CUTOFF_TIME_OVERRIDE:-10:00}"
+
+          # Static fallback strike ranges
           NIFTY_STRIKE_MIN="${NIFTY_STRIKE_MIN_OVERRIDE:-21000}"
           NIFTY_STRIKE_MAX="${NIFTY_STRIKE_MAX_OVERRIDE:-26000}"
           SENSEX_STRIKE_MIN="${SENSEX_STRIKE_MIN_OVERRIDE:-71000}"
-          SENSEX_STRIKE_MAX="${SENSEX_STRIKE_MAX_OVERRIDE:-71000}"
+          SENSEX_STRIKE_MAX="${SENSEX_STRIKE_MAX_OVERRIDE:-73000}"
+
           EMA_FAST_PERIOD="${EMA_FAST_PERIOD_OVERRIDE:-9}"
           EMA_SLOW_PERIOD="${EMA_SLOW_PERIOD_OVERRIDE:-21}"
 
@@ -97,6 +119,8 @@ jobs:
 
           cat > .env <<EOF
           REQUEST_TIMEOUT_SECONDS=30
+          UPSTOX_REQUEST_TIMEOUT_SECONDS=60
+          UPSTOX_CONNECT_TIMEOUT_SECONDS=10
           LOG_LEVEL=INFO
           LOG_FILE=logs/backup.log
           DATA_DIR=data
@@ -112,6 +136,13 @@ jobs:
           INSTRUMENTS_CACHE_DIR=data/_cache
           NIFTY_UNDERLYING=NIFTY
           SENSEX_UNDERLYING=SENSEX
+          NIFTY_INDEX_INSTRUMENT_KEY=NSE_INDEX|Nifty 50
+          SENSEX_INDEX_INSTRUMENT_KEY=BSE_INDEX|SENSEX
+          NIFTY_STRIKE_RANGE_POINTS=${NIFTY_STRIKE_RANGE_POINTS}
+          SENSEX_STRIKE_RANGE_POINTS=${SENSEX_STRIKE_RANGE_POINTS}
+          NIFTY_STRIKE_ROUNDING=${NIFTY_STRIKE_ROUNDING}
+          SENSEX_STRIKE_ROUNDING=${SENSEX_STRIKE_ROUNDING}
+          STRIKE_RANGE_MODE_CUTOFF_TIME=${STRIKE_RANGE_MODE_CUTOFF_TIME}
           NIFTY_STRIKE_MIN=${NIFTY_STRIKE_MIN}
           NIFTY_STRIKE_MAX=${NIFTY_STRIKE_MAX}
           SENSEX_STRIKE_MIN=${SENSEX_STRIKE_MIN}
@@ -139,8 +170,11 @@ jobs:
 
           echo "Wrote .env"
           echo "MEGA_BACKUP_FOLDER=${MEGA_BACKUP_FOLDER}"
-          echo "NIFTY_STRIKE range=${NIFTY_STRIKE_MIN}..${NIFTY_STRIKE_MAX}"
-          echo "SENSEX_STRIKE range=${SENSEX_STRIKE_MIN}..${SENSEX_STRIKE_MAX}"
+          echo "STRIKE_RANGE_MODE_CUTOFF_TIME=${STRIKE_RANGE_MODE_CUTOFF_TIME} IST"
+          echo "NIFTY dynamic strike: ±${NIFTY_STRIKE_RANGE_POINTS} (round ${NIFTY_STRIKE_ROUNDING})"
+          echo "SENSEX dynamic strike: ±${SENSEX_STRIKE_RANGE_POINTS} (round ${SENSEX_STRIKE_ROUNDING})"
+          echo "NIFTY fallback range=${NIFTY_STRIKE_MIN}..${NIFTY_STRIKE_MAX}"
+          echo "SENSEX fallback range=${SENSEX_STRIKE_MIN}..${SENSEX_STRIKE_MAX}"
           echo "EMA_FAST=${EMA_FAST_PERIOD} EMA_SLOW=${EMA_SLOW_PERIOD}"
           echo "TELEGRAM_ENABLED=${TELEGRAM_ENABLED}"
           echo "MONGO_ENABLED=${MONGO_ENABLED}"
@@ -156,6 +190,10 @@ jobs:
           du -sh data/ || true
           echo "File count:"
           find data/ -type f | wc -l || true
+          echo "Strike-range log lines (window / mode / candle_ts):"
+          grep -E "\[STRIKE-RANGE\]" logs/backup.log 2>/dev/null || true
+          echo "Index folders:"
+          ls -R data/index 2>/dev/null | head -50 || true
           echo "Options folders:"
           ls -R data/nifty data/sensex 2>/dev/null | head -50 || true
 
