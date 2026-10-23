@@ -15,13 +15,22 @@ Returned instruments include two categories:
    up under ``data/index/<name>/``.
 2. The nearest-expiry CE/PE options per underlying, filtered to a
    **dynamic strike window** derived from the index's intraday candles
-   (see ``strike_range_service``). When that computation fails the static
-   ``*_STRIKE_MIN/MAX`` settings are used as a fallback.
+   (see ``strike_range_service``).
 
-Every successful discovery run also writes a snapshot of the final
-instrument list to ``settings.all_instruments_file`` (default
-``<BASE_DIR.parent>/mega_archive_service/storage/mega/all_instruments.json``)
-via ``all_instruments_service.save_all_instruments``.
+Strike-range resolution is a three-tier fallback per underlying:
+
+    Tier 1  dynamic range  (from first/last intraday candle)
+    Tier 2  static range   (NIFTY_STRIKE_MIN/MAX, SENSEX_STRIKE_MIN/MAX)
+    Tier 3  auto-detected range (min..max of every active CE/PE strike
+            for that underlying in the archive)
+
+If Tier 1 fails, Tier 2 is tried; if Tier 2 also yields **zero** option
+contracts, Tier 3 kicks in so the snapshot always contains real option
+strikes whenever the archive carries any.
+
+Every discovery run writes a snapshot of the final instrument list to
+``settings.all_instruments_file`` via
+``all_instruments_service.save_all_instruments``.
 """
 
 from __future__ import annotations
@@ -181,7 +190,7 @@ def _matches_underlying(item: dict[str, Any], target: str) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
-# Filtering
+# Strike helpers
 # ---------------------------------------------------------------------------
 
 def _strike_of(item: dict[str, Any]) -> float | None:
@@ -195,6 +204,67 @@ def _now_ist() -> datetime:
     return datetime.now(_MARKET_TZ)
 
 
+def _is_active_option(
+    item: dict[str, Any],
+    target: str,
+    now: datetime,
+    cutoff_today: datetime,
+) -> bool:
+    """True if ``item`` is a currently-active CE/PE for ``target``."""
+    if not isinstance(item, dict):
+        return False
+    if _norm(item.get("instrument_type")) not in _DEFAULT_TYPES:
+        return False
+    if not _matches_underlying(item, target):
+        return False
+    exp = _parse_expiry(item.get("expiry"))
+    if exp is None:
+        return False
+    if exp.date() < now.date():
+        return False
+    if exp.date() == now.date() and now >= cutoff_today:
+        return False
+    if _strike_of(item) is None:
+        return False
+    return True
+
+
+def _auto_detect_strike_range(
+    instruments: list[dict[str, Any]],
+    target: str,
+    now: datetime | None = None,
+) -> tuple[float, float] | None:
+    """Return ``(min_strike, max_strike)`` of every active CE/PE for ``target``.
+
+    Used as a last-resort fallback when both the dynamic and static
+    strike ranges yield zero option contracts. Returns ``None`` if the
+    archive has no active options for the underlying at all.
+    """
+    now = now or _now_ist()
+    cutoff_today = now.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    strikes: list[float] = []
+    for item in instruments:
+        if not _is_active_option(item, target, now, cutoff_today):
+            continue
+        strike = _strike_of(item)
+        if strike is not None:
+            strikes.append(strike)
+
+    if not strikes:
+        return None
+
+    lo, hi = min(strikes), max(strikes)
+    logger.info(
+        "Auto-detected strike range %s: [%.0f, %.0f] from %d active option(s)",
+        target, lo, hi, len(strikes),
+    )
+    return lo, hi
+
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
+
 def filter_nearest_expiry_options(
     instruments: list[dict[str, Any]],
     underlying_symbols: list[str],
@@ -202,12 +272,7 @@ def filter_nearest_expiry_options(
     instrument_types: tuple[str, ...] = _DEFAULT_TYPES,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Return nearest-expiry option contracts (strike + type filtered).
-
-    ``strike_ranges`` maps upper-case underlying name -> (min, max).
-    Contracts outside the range or with a different type are dropped.
-    Only the nearest future expiry (>= today, and > now if today) is kept.
-    """
+    """Return nearest-expiry option contracts (strike + type filtered)."""
     now = now or _now_ist()
     today = now.date()
     cutoff_today = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -283,11 +348,6 @@ def filter_nearest_expiry_options(
 # ---------------------------------------------------------------------------
 
 def _build_index_rows() -> list[dict[str, Any]]:
-    """Minimal index rows consumed directly by the candle/EMA pipeline.
-
-    Their ``instrument_key`` starts with ``NSE_INDEX|`` / ``BSE_INDEX|``
-    so ``instrument_paths`` routes them to ``data/index/<name>/``.
-    """
     rows: list[dict[str, Any]] = []
     for key, symbol in (
         (settings.nifty_index_instrument_key, settings.nifty_underlying),
@@ -306,16 +366,92 @@ def _build_index_rows() -> list[dict[str, Any]]:
     return rows
 
 # ---------------------------------------------------------------------------
+# Per-underlying strike-range resolution (3-tier fallback)
+# ---------------------------------------------------------------------------
+
+def _resolve_range_with_fallback(
+    archive: list[dict[str, Any]],
+    target_upper: str,
+    target_orig: str,
+    dynamic: dict[str, tuple[float, float]],
+    static_min: float,
+    static_max: float,
+) -> list[dict[str, Any]]:
+    """Return options for one underlying, using a 3-tier strike fallback.
+
+    Tier 1  dynamic range (from intraday candles)
+    Tier 2  static range  (from .env)
+    Tier 3  auto-detected range (from the archive itself)
+    """
+    dynamic_range = dynamic.get(target_upper)
+
+    # ---- Tier 1: dynamic --------------------------------------------
+    if dynamic_range is not None:
+        options = filter_nearest_expiry_options(
+            archive,
+            underlying_symbols=[target_orig],
+            strike_ranges={target_upper: dynamic_range},
+        )
+        if options:
+            logger.info(
+                "Using DYNAMIC strike range for %s: [%s, %s] -> %d option(s)",
+                target_upper, dynamic_range[0], dynamic_range[1], len(options),
+            )
+            return options
+        logger.warning(
+            "Dynamic strike range %s for %s yielded 0 options; "
+            "falling back to static range",
+            dynamic_range, target_upper,
+        )
+
+    # ---- Tier 2: static ---------------------------------------------
+    static_range = (static_min, static_max)
+    options = filter_nearest_expiry_options(
+        archive,
+        underlying_symbols=[target_orig],
+        strike_ranges={target_upper: static_range},
+    )
+    if options:
+        logger.info(
+            "Using STATIC strike range for %s: [%s, %s] -> %d option(s)",
+            target_upper, static_min, static_max, len(options),
+        )
+        return options
+    logger.warning(
+        "Static strike range %s for %s yielded 0 options; "
+        "falling back to auto-detected range",
+        static_range, target_upper,
+    )
+
+    # ---- Tier 3: auto-detect from the archive -----------------------
+    auto = _auto_detect_strike_range(archive, target_upper)
+    if auto is None:
+        logger.error(
+            "No active options exist for %s in the entire archive; "
+            "nothing to include in all_instruments.json",
+            target_upper,
+        )
+        return []
+
+    options = filter_nearest_expiry_options(
+        archive,
+        underlying_symbols=[target_orig],
+        strike_ranges={target_upper: auto},
+    )
+    logger.info(
+        "Using AUTO-DETECTED strike range for %s: [%.0f, %.0f] -> %d option(s)",
+        target_upper, auto[0], auto[1], len(options),
+    )
+    return options
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
     """Download the archive and return the full instrument list to fetch.
 
-    Returns the main index rows plus the nearest-expiry, dynamically
-    strike-filtered option contracts for every configured underlying.
-    Also writes an ``all_instruments.json`` snapshot keyed by
-    ``instrument_key`` (see ``all_instruments_service``).
+    Also writes ``all_instruments.json`` keyed by ``instrument_key``.
     """
     archive = download_instruments(force=force_download)
 
@@ -329,42 +465,37 @@ def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
         )
         dynamic = {}
 
-    nifty_range = dynamic.get(settings.nifty_underlying.upper())
-    if nifty_range is None:
-        nifty_range = (settings.nifty_strike_min, settings.nifty_strike_max)
-        logger.warning(
-            "Using static NIFTY strike range %s (dynamic unavailable)",
-            nifty_range,
-        )
-
-    sensex_range = dynamic.get(settings.sensex_underlying.upper())
-    if sensex_range is None:
-        sensex_range = (settings.sensex_strike_min, settings.sensex_strike_max)
-        logger.warning(
-            "Using static SENSEX strike range %s (dynamic unavailable)",
-            sensex_range,
-        )
-
-    strike_ranges: dict[str, tuple[float, float]] = {
-        settings.nifty_underlying.upper(): nifty_range,
-        settings.sensex_underlying.upper(): sensex_range,
-    }
-
-    # ---- Options -----------------------------------------------------
-    underlyings = [settings.nifty_underlying, settings.sensex_underlying]
-    options = filter_nearest_expiry_options(
+    # ---- Per-underlying option resolution ---------------------------
+    nifty_options = _resolve_range_with_fallback(
         archive,
-        underlying_symbols=underlyings,
-        strike_ranges=strike_ranges,
+        target_upper=settings.nifty_underlying.upper(),
+        target_orig=settings.nifty_underlying,
+        dynamic=dynamic,
+        static_min=settings.nifty_strike_min,
+        static_max=settings.nifty_strike_max,
+    )
+
+    sensex_options = _resolve_range_with_fallback(
+        archive,
+        target_upper=settings.sensex_underlying.upper(),
+        target_orig=settings.sensex_underlying,
+        dynamic=dynamic,
+        static_min=settings.sensex_strike_min,
+        static_max=settings.sensex_strike_max,
     )
 
     # ---- Index rows --------------------------------------------------
     indices = _build_index_rows()
 
-    combined = indices + options
+    combined = indices + nifty_options + sensex_options
     logger.info(
-        "Discovered %d instrument(s): %d index rows + %d option contracts",
-        len(combined), len(indices), len(options),
+        "Discovered %d instrument(s): %d index rows + %d option contracts "
+        "(NIFTY=%d, SENSEX=%d)",
+        len(combined),
+        len(indices),
+        len(nifty_options) + len(sensex_options),
+        len(nifty_options),
+        len(sensex_options),
     )
 
     # ---- all_instruments.json snapshot -------------------------------

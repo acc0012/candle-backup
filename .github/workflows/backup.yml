@@ -49,33 +49,26 @@ jobs:
 
       - name: Write .env
         env:
-          # ---- Required secrets -------------------------------------
           MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
-          # ---- Optional secrets -------------------------------------
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MONGO_URL: ${{ secrets.MONGO_URL }}
-          # ---- Optional repository variables ------------------------
           MEGA_BACKUP_FOLDER_OVERRIDE: ${{ vars.MEGA_BACKUP_FOLDER }}
           MONGO_DB_NAME_OVERRIDE: ${{ vars.MONGO_DB_NAME }}
           MONGO_MAX_BLOB_MB_OVERRIDE: ${{ vars.MONGO_MAX_BLOB_MB }}
           ALL_INSTRUMENTS_FILE_OVERRIDE: ${{ vars.ALL_INSTRUMENTS_FILE }}
-          # Dynamic strike-range tuning
           NIFTY_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.NIFTY_STRIKE_RANGE_POINTS }}
           SENSEX_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.SENSEX_STRIKE_RANGE_POINTS }}
           NIFTY_STRIKE_ROUNDING_OVERRIDE: ${{ vars.NIFTY_STRIKE_ROUNDING }}
           SENSEX_STRIKE_ROUNDING_OVERRIDE: ${{ vars.SENSEX_STRIKE_ROUNDING }}
           STRIKE_RANGE_MODE_CUTOFF_TIME_OVERRIDE: ${{ vars.STRIKE_RANGE_MODE_CUTOFF_TIME }}
-          # Static fallback strike ranges
           NIFTY_STRIKE_MIN_OVERRIDE: ${{ vars.NIFTY_STRIKE_MIN }}
           NIFTY_STRIKE_MAX_OVERRIDE: ${{ vars.NIFTY_STRIKE_MAX }}
           SENSEX_STRIKE_MIN_OVERRIDE: ${{ vars.SENSEX_STRIKE_MIN }}
           SENSEX_STRIKE_MAX_OVERRIDE: ${{ vars.SENSEX_STRIKE_MAX }}
-          # EMA periods
           EMA_FAST_PERIOD_OVERRIDE: ${{ vars.EMA_FAST_PERIOD }}
           EMA_SLOW_PERIOD_OVERRIDE: ${{ vars.EMA_SLOW_PERIOD }}
-          # ---- Manual-run input -------------------------------------
           INTRADAY_TEST_MODE: ${{ github.event.inputs.intraday_test_mode || 'true' }}
         run: |
           : "${MEGA_EMAIL:?MEGA_EMAIL secret is required}"
@@ -85,22 +78,17 @@ jobs:
           MONGO_DB_NAME="${MONGO_DB_NAME_OVERRIDE:-UPSTOX_APP_V2}"
           MONGO_MAX_BLOB_MB="${MONGO_MAX_BLOB_MB_OVERRIDE:-15}"
 
-          # Optional: override the all_instruments.json path.
-          # If unset, the Python default is used:
-          #   <BASE_DIR.parent>/mega_archive_service/storage/mega/all_instruments.json
           ALL_INSTRUMENTS_LINE=""
           if [ -n "${ALL_INSTRUMENTS_FILE_OVERRIDE}" ]; then
             ALL_INSTRUMENTS_LINE="ALL_INSTRUMENTS_FILE=${ALL_INSTRUMENTS_FILE_OVERRIDE}"
           fi
 
-          # Dynamic strike-range tuning
           NIFTY_STRIKE_RANGE_POINTS="${NIFTY_STRIKE_RANGE_POINTS_OVERRIDE:-500}"
           SENSEX_STRIKE_RANGE_POINTS="${SENSEX_STRIKE_RANGE_POINTS_OVERRIDE:-1000}"
           NIFTY_STRIKE_ROUNDING="${NIFTY_STRIKE_ROUNDING_OVERRIDE:-50}"
           SENSEX_STRIKE_ROUNDING="${SENSEX_STRIKE_ROUNDING_OVERRIDE:-100}"
           STRIKE_RANGE_MODE_CUTOFF_TIME="${STRIKE_RANGE_MODE_CUTOFF_TIME_OVERRIDE:-10:00}"
 
-          # Static fallback strike ranges
           NIFTY_STRIKE_MIN="${NIFTY_STRIKE_MIN_OVERRIDE:-21000}"
           NIFTY_STRIKE_MAX="${NIFTY_STRIKE_MAX_OVERRIDE:-26000}"
           SENSEX_STRIKE_MIN="${SENSEX_STRIKE_MIN_OVERRIDE:-71000}"
@@ -206,10 +194,38 @@ jobs:
           ls -R data/index 2>/dev/null | head -50 || true
           echo "Options folders:"
           ls -R data/nifty data/sensex 2>/dev/null | head -50 || true
+
+      - name: Verify all_instruments.json
+        if: always()
+        run: |
           echo "all_instruments.json:"
-          ls -la ../mega_archive_service/storage/mega/all_instruments.json 2>/dev/null \
-            && head -40 ../mega_archive_service/storage/mega/all_instruments.json 2>/dev/null \
-            || echo "(not written this run)"
+          ALL_JSON="../mega_archive_service/storage/mega/all_instruments.json"
+          ls -la "$ALL_JSON" 2>/dev/null || echo "(not written this run)"
+          if [ -f "$ALL_JSON" ]; then
+            python - <<'PY'
+          import json, sys
+          p = "../mega_archive_service/storage/mega/all_instruments.json"
+          try:
+              data = json.load(open(p, encoding="utf-8"))
+          except Exception as e:
+              print(f"FAILED to parse {p}: {e}")
+              sys.exit(0)
+          total = len(data)
+          idx = sum(1 for v in data.values()
+                    if str(v.get("strike_type") or "").upper() == "INDEX")
+          opt = total - idx
+          print(f"Entries total={total} indices={idx} options={opt}")
+          if idx > 0 and opt == 0:
+              print("::warning::all_instruments.json contains ONLY index rows "
+                    "(no option contracts). Check the STRIKE-RANGE fallbacks.")
+          else:
+              print("OK — all_instruments.json contains option contracts.")
+          # Print a small sample
+          for i, (k, v) in enumerate(list(data.items())[:5]):
+              print(f"  sample[{i}] {k} -> {v.get('strike_type')} "
+                    f"expiry={v.get('expiry')}")
+          PY
+          fi
 
       - name: Upload logs on failure
         if: failure()

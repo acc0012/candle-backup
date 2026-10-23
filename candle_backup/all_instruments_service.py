@@ -12,14 +12,7 @@ Output shape — one object keyed by ``instrument_key``::
         "expiry": "2026-10-29",
         "trading_symbol": "SENSEX 72100 CE 29 OCT 26"
       },
-      "NSE_INDEX|Nifty 50": {
-        "instrument_key": "NSE_INDEX|Nifty 50",
-        "underlying": "NIFTY",
-        "strike_price": null,
-        "strike_type": "INDEX",
-        "expiry": null,
-        "trading_symbol": "Nifty 50"
-      },
+      "NSE_INDEX|Nifty 50": { ... },
       ...
     }
 
@@ -28,9 +21,14 @@ Key notes
 * ``expiry`` is stored as a **readable ISO date** (``"YYYY-MM-DD"``),
   converted from the raw epoch-ms value in the Upstox archive.
 * Index rows (``NSE_INDEX|…`` / ``BSE_INDEX|…``) carry ``strike_price:
-  null`` and ``strike_type: "INDEX"`` — they are included so downstream
-  consumers can key off the same instrument identifiers.
-* The file is a per-run **snapshot**; it is overwritten each time.
+  null`` and ``strike_type: "INDEX"``.
+* The file is written atomically (``.tmp`` + ``replace``).
+* After the write, the file is **read back** and the entry count is
+  compared against what we intended to write — any mismatch is logged
+  as an error so silent corruption cannot go unnoticed.
+* Explicit counts of index vs option rows are logged. If the write
+  contains index rows but zero options, a loud warning is emitted
+  because that almost always means the strike filter matched nothing.
 * Failures are logged and swallowed — never abort the backup.
 """
 
@@ -59,7 +57,6 @@ def _readable_expiry(raw: Any) -> str | None:
     if raw is None:
         return None
 
-    # Epoch seconds / milliseconds (typical for the archive).
     try:
         ts = float(raw)
         if ts > 1e11:
@@ -126,15 +123,24 @@ def save_all_instruments(
         )
         return None
 
+    # ---- Build payload -----------------------------------------------
     payload: dict[str, dict[str, Any]] = {}
+    index_count = 0
+    option_count = 0
     for item in instruments:
         if not isinstance(item, dict):
             continue
         key = item.get("instrument_key")
         if not isinstance(key, str) or not key.strip():
             continue
-        payload[key.strip()] = _record_for(item)
+        record = _record_for(item)
+        payload[key.strip()] = record
+        if str(record.get("strike_type") or "").upper() == "INDEX":
+            index_count += 1
+        else:
+            option_count += 1
 
+    # ---- Write atomically --------------------------------------------
     try:
         tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(
@@ -147,6 +153,40 @@ def save_all_instruments(
         return None
 
     logger.info(
-        "Wrote %d instrument(s) to %s", len(payload), target,
+        "Wrote %d instrument(s) to %s (indices=%d options=%d)",
+        len(payload), target, index_count, option_count,
     )
+
+    # ---- Loud warning when only indices landed ----------------------
+    if index_count > 0 and option_count == 0:
+        logger.warning(
+            "all_instruments.json contains ONLY index rows (%d) and no "
+            "option contracts. This usually means the strike filter "
+            "matched nothing — check the [STRIKE-RANGE] log lines and "
+            "the static fallback range in .env.",
+            index_count,
+        )
+
+    # ---- Read-back verification -------------------------------------
+    try:
+        readback = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(readback, dict):
+            logger.error(
+                "Verification failed: all_instruments.json is not a JSON "
+                "object (got %s)",
+                type(readback).__name__,
+            )
+        elif len(readback) != len(payload):
+            logger.error(
+                "Verification mismatch: wrote %d entries but read back %d",
+                len(payload), len(readback),
+            )
+        else:
+            logger.info(
+                "Verified all_instruments.json: %d entries present",
+                len(readback),
+            )
+    except Exception:
+        logger.exception("Failed to verify all_instruments.json")
+
     return target
