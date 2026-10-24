@@ -132,14 +132,12 @@ class Settings:
     )
 
     # ---- Dynamic strike ranges ---------------------------------------
-    # NIFTY:   ±500 pts, rounded to 50
-    # SENSEX:  ±1000 pts, rounded to 100
-    nifty_strike_range_points: float = _env_float(
-        "NIFTY_STRIKE_RANGE_POINTS", 1000.0
-    )
-    sensex_strike_range_points: float = _env_float(
-        "SENSEX_STRIKE_RANGE_POINTS", 2000.0
-    )
+    # NIFTY:   ±nifty_strike_range_points pts, rounded to 50
+    # SENSEX:  ±sensex_strike_range_points pts, rounded to 100
+    nifty_strike_range_points: float = 1000.0
+    
+    sensex_strike_range_points: float =  2000.0
+    
     nifty_strike_rounding: float = _env_float(
         "NIFTY_STRIKE_ROUNDING", 50.0
     )
