@@ -14,20 +14,17 @@ ENV_FILE = BASE_DIR / ".env"
 
 load_dotenv(dotenv_path=ENV_FILE, override=False)
 
-
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
-
 def _env_str(name: str, default: str = "") -> str:
     raw = os.getenv(name)
     if raw is None:
         return default
     return raw.strip().strip('"').strip("'")
-
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -38,7 +35,6 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
-
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -47,7 +43,6 @@ def _env_int(name: str, default: int) -> int:
         return int(raw.strip())
     except ValueError:
         return default
-
 
 def _env_path(name: str, default: Path) -> Path:
     """Path env var: blank -> default; absolute -> as-is; relative ->
@@ -60,7 +55,6 @@ def _env_path(name: str, default: Path) -> Path:
     if not p.is_absolute():
         p = (BASE_DIR / p).resolve()
     return p
-
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -103,16 +97,6 @@ class Settings:
     )
 
     # ---- All-instruments snapshot file --------------------------------
-    # Written after every discover_instruments() run, keyed by
-    # instrument_key with expiry already converted to a readable date.
-    #
-    # Default: <DATA_DIR>/all_instruments.json
-    #   -> "data/all_instruments.json" with the default DATA_DIR=data.
-    # Because it lives inside data/, it is automatically included in
-    # the MEGA backup zip and shows up as "all_instruments.json" at
-    # the archive root.
-    #
-    # Override via ALL_INSTRUMENTS_FILE (absolute or BASE_DIR-relative).
     all_instruments_file: Path = _env_path(
         "ALL_INSTRUMENTS_FILE",
         BASE_DIR / os.getenv("DATA_DIR", "data") / "all_instruments.json",
@@ -122,8 +106,6 @@ class Settings:
     nifty_underlying: str = _env_str("NIFTY_UNDERLYING", "NIFTY")
     sensex_underlying: str = _env_str("SENSEX_UNDERLYING", "SENSEX")
 
-    # Main index instrument keys — fetched intraday to derive the
-    # dynamic strike window, and backed up under data/index/<name>/.
     nifty_index_instrument_key: str = _env_str(
         "NIFTY_INDEX_INSTRUMENT_KEY", "NSE_INDEX|Nifty 50"
     )
@@ -132,12 +114,9 @@ class Settings:
     )
 
     # ---- Dynamic strike ranges ---------------------------------------
-    # NIFTY:   ±nifty_strike_range_points pts, rounded to 50
-    # SENSEX:  ±sensex_strike_range_points pts, rounded to 100
     nifty_strike_range_points: float = 1000.0
-    
-    sensex_strike_range_points: float =  2000.0
-    
+    sensex_strike_range_points: float = 2000.0
+
     nifty_strike_rounding: float = _env_float(
         "NIFTY_STRIKE_ROUNDING", 50.0
     )
@@ -145,13 +124,10 @@ class Settings:
         "SENSEX_STRIKE_ROUNDING", 100.0
     )
 
-    # Time (HH:MM IST) that separates "use first candle" from "use last
-    # candle" when picking the reference close for the strike window.
     strike_range_mode_cutoff_time: str = _env_str(
         "STRIKE_RANGE_MODE_CUTOFF_TIME", "10:00"
     )
 
-    # Static fallbacks — only used when the dynamic computation fails.
     nifty_strike_min: float = _env_float("NIFTY_STRIKE_MIN", 21000.0)
     nifty_strike_max: float = _env_float("NIFTY_STRIKE_MAX", 26000.0)
     sensex_strike_min: float = _env_float("SENSEX_STRIKE_MIN", 71000.0)
@@ -161,7 +137,6 @@ class Settings:
     ema_fast_period: int = int(os.getenv("EMA_FAST_PERIOD", "9"))
     ema_slow_period: int = int(os.getenv("EMA_SLOW_PERIOD", "21"))
 
-    # ---- EMA validation (cross scoring) -------------------------------
     ema_enable_validation: bool = _env_bool("EMA_ENABLE_VALIDATION", True)
     ema_min_validation_score: int = _env_int("EMA_MIN_VALIDATION_SCORE", 3)
 
@@ -180,6 +155,17 @@ class Settings:
     ema_volume_lookback: int = _env_int("EMA_VOLUME_LOOKBACK", 20)
     ema_volume_mult: float = _env_float("EMA_VOLUME_MULT", 1.0)
     ema_distance_atr_max: float = _env_float("EMA_DISTANCE_ATR_MAX", 1.5)
+
+    # ---- Support / Resistance levels ----------------------------------
+    # Mirrors the Pine Script indicator parameters
+    # (Support and Resistance Levels with Breaks).
+    #
+    # A pivot is only "confirmed" right_bars bars after the pivot bar
+    # itself. ``sr_levels.json`` records both timestamps so the
+    # confirmation moment is explicit.
+    sr_enabled: bool = _env_bool("SR_ENABLED", True)
+    sr_left_bars: int = _env_int("SR_LEFT_BARS", 15)
+    sr_right_bars: int = _env_int("SR_RIGHT_BARS", 15)
 
     # ---- MEGA backup --------------------------------------------------
     mega_enabled: bool = _env_bool("MEGA_ENABLED", True)
@@ -223,6 +209,5 @@ class Settings:
     upstox_connect_timeout_seconds: float = _env_float(
         "UPSTOX_CONNECT_TIMEOUT_SECONDS", 10.0
     )
-
 
 settings = Settings()

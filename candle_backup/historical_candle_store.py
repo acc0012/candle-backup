@@ -1,15 +1,18 @@
-"""Keep a rolling local cache of candles + EMA crosses.
+# candle_backup/historical_candle_store.py
+"""Keep a rolling local cache of candles + EMA crosses + SR levels.
 
-Job A — ``ensure_recent_candles`` (historical, last N days)
-Job B — ``ensure_intraday_candles`` (today only)
-Job C — ``compute_ema_crosses`` (writes ema_crosses.json with rich fields)
+Job A — ``ensure_recent_candles``     (historical, last N days)
+Job B — ``ensure_intraday_candles``   (today only)
+Job C — ``compute_ema_crosses``       (writes ema_crosses.json)
+Job D — ``compute_sr_levels``         (writes sr_levels.json)
 
-The three jobs write into the same per-instrument directory:
+The four jobs write into the same per-instrument directory::
 
     data/<underlying>/<strike>_<type>/candles.json
     data/<underlying>/<strike>_<type>/ema_crosses.json
+    data/<underlying>/<strike>_<type>/sr_levels.json
 
-``ensure_candles_and_emas`` runs all three in order.
+``ensure_candles_and_emas`` runs all four in order.
 """
 
 from __future__ import annotations
@@ -26,14 +29,15 @@ from candle_backup.ema import EmaValidationConfig, detect_crosses
 from candle_backup.instrument_paths import (
     build_candle_path,
     build_ema_path,
+    build_sr_path,
 )
 from candle_backup.logger import get_logger
+from candle_backup.sr_levels import update_sr_levels_for_instrument
 from candle_backup.upstox_fetcher import fetch_historical, fetch_intraday
 
 logger = get_logger(__name__)
 
 _INTRADAY_WINDOW_END = dt_time(23, 59)
-
 
 def _parse_hhmm(value: str) -> dt_time:
     try:
@@ -43,12 +47,10 @@ def _parse_hhmm(value: str) -> dt_time:
         logger.warning("Invalid time value '%s'; falling back to 00:00", value)
         return dt_time(0, 0)
 
-
 def _json_default(obj: Any) -> str:
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     return str(obj)
-
 
 class HistoricalCandleStore:
     def __init__(self) -> None:
@@ -74,6 +76,12 @@ class HistoricalCandleStore:
         self.ema_total_crosses = 0
         self.ema_valid_crosses = 0
         self.ema_failed_count = 0
+
+        # SR state.
+        self.sr_files_written = 0
+        self.sr_total_levels = 0
+        self.sr_new_levels = 0
+        self.sr_failed_count = 0
 
     # ------------------------------------------------------------------ #
     # Time helpers                                                        #
@@ -113,10 +121,12 @@ class HistoricalCandleStore:
         hist = await self.ensure_recent_candles(instruments, reason=reason)
         intra = await self.ensure_intraday_candles(instruments, reason=reason)
         ema = self.compute_ema_crosses(instruments, reason=reason)
+        sr = self.compute_sr_levels(instruments, reason=reason)
         return {
             "historical": hist,
             "intraday": intra,
             "ema_crosses": ema,
+            "sr_levels": sr,
         }
 
     # ------------------------------------------------------------------ #
@@ -185,6 +195,7 @@ class HistoricalCandleStore:
         to_date: date,
         strict: bool,
     ) -> None:
+        # ---- Unchanged from the current file ------------------------
         instrument_key = item.get("instrument_key")
         if not isinstance(instrument_key, str) or not instrument_key.strip():
             self.skipped_count += 1
@@ -238,13 +249,14 @@ class HistoricalCandleStore:
         self._processed_count += 1
 
     # ------------------------------------------------------------------ #
-    # Intraday                                                            #
+    # Intraday (unchanged)                                                #
     # ------------------------------------------------------------------ #
     async def ensure_intraday_candles(
         self,
         instruments: list[dict[str, Any]],
         reason: str = "backup",
     ) -> dict[str, Any]:
+        # ---- Full body unchanged from current file ------------------
         async with self._lock:
             now_local = self._now_market_tz()
             window_open = self._intraday_window_open(now_local)
@@ -319,6 +331,7 @@ class HistoricalCandleStore:
         item: dict[str, Any],
         cutoff: date,
     ) -> None:
+        # ---- Unchanged from current file ----------------------------
         instrument_key = item.get("instrument_key")
         if not isinstance(instrument_key, str) or not instrument_key.strip():
             self.intraday_empty_count += 1
@@ -354,14 +367,14 @@ class HistoricalCandleStore:
         self._intraday_processed_count += 1
 
     # ------------------------------------------------------------------ #
-    # EMA crosses (with rich per-cross scoring)                           #
+    # EMA crosses (unchanged body)                                        #
     # ------------------------------------------------------------------ #
     def compute_ema_crosses(
         self,
         instruments: list[dict[str, Any]],
         reason: str = "backup",
     ) -> dict[str, Any]:
-        """Load each candle file, detect scored EMA crosses, write ema_crosses.json."""
+        # ---- Full body unchanged from current file ------------------
         fast = settings.ema_fast_period
         slow = settings.ema_slow_period
 
@@ -467,7 +480,91 @@ class HistoricalCandleStore:
         return summary
 
     # ------------------------------------------------------------------ #
-    # Disk IO / freshness                                                 #
+    # Support / Resistance levels (NEW)                                   #
+    # ------------------------------------------------------------------ #
+    def compute_sr_levels(
+        self,
+        instruments: list[dict[str, Any]],
+        reason: str = "backup",
+    ) -> dict[str, Any]:
+        """Load each candle file, detect pivots, write sr_levels.json."""
+        if not settings.sr_enabled:
+            summary = {
+                "reason": reason,
+                "enabled": False,
+                "files_written": 0,
+                "total_levels": 0,
+                "new_levels": 0,
+                "failed": 0,
+            }
+            logger.info("SR levels job skipped (SR_ENABLED=false); %s", summary)
+            return summary
+
+        left_bars = max(1, settings.sr_left_bars)
+        right_bars = max(1, settings.sr_right_bars)
+
+        self.sr_files_written = 0
+        self.sr_total_levels = 0
+        self.sr_new_levels = 0
+        self.sr_failed_count = 0
+
+        for item in instruments:
+            if not isinstance(item, dict):
+                continue
+            instrument_key = item.get("instrument_key")
+            if not isinstance(instrument_key, str) or not instrument_key.strip():
+                continue
+
+            candle_path = build_candle_path(item)
+            candles = self._load_existing(candle_path)
+            if not candles:
+                continue
+
+            sr_path = build_sr_path(item)
+            try:
+                result = update_sr_levels_for_instrument(
+                    instrument_key=instrument_key,
+                    candles=candles,
+                    path=sr_path,
+                    left_bars=left_bars,
+                    right_bars=right_bars,
+                )
+            except Exception:
+                self.sr_failed_count += 1
+                logger.exception(
+                    "SR level update failed; instrument=%s", instrument_key
+                )
+                continue
+
+            if result.get("error"):
+                self.sr_failed_count += 1
+                logger.warning(
+                    "SR level update reported an error; instrument=%s "
+                    "error=%s",
+                    instrument_key, result["error"],
+                )
+                continue
+
+            if result.get("written"):
+                self.sr_files_written += 1
+                self.sr_total_levels += int(result.get("total") or 0)
+                self.sr_new_levels += int(result.get("new") or 0)
+
+        summary = {
+            "reason": reason,
+            "enabled": True,
+            "left_bars": left_bars,
+            "right_bars": right_bars,
+            "files_written": self.sr_files_written,
+            "total_levels": self.sr_total_levels,
+            "new_levels": self.sr_new_levels,
+            "failed": self.sr_failed_count,
+        }
+        logger.info("SR level job completed; %s", summary)
+        return summary
+
+    # ------------------------------------------------------------------ #
+    # Disk IO / freshness (unchanged)                                     #
     # ------------------------------------------------------------------ #
     def _load_existing(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
@@ -562,6 +659,5 @@ class HistoricalCandleStore:
         return sorted(
             merged.values(), key=lambda c: str(c.get("timestamp", ""))
         )
-
 
 historical_candle_store = HistoricalCandleStore()

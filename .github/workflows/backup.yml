@@ -70,6 +70,9 @@ jobs:
           SENSEX_STRIKE_MAX_OVERRIDE: ${{ vars.SENSEX_STRIKE_MAX }}
           EMA_FAST_PERIOD_OVERRIDE: ${{ vars.EMA_FAST_PERIOD }}
           EMA_SLOW_PERIOD_OVERRIDE: ${{ vars.EMA_SLOW_PERIOD }}
+          SR_ENABLED_OVERRIDE: ${{ vars.SR_ENABLED }}
+          SR_LEFT_BARS_OVERRIDE: ${{ vars.SR_LEFT_BARS }}
+          SR_RIGHT_BARS_OVERRIDE: ${{ vars.SR_RIGHT_BARS }}
           INTRADAY_TEST_MODE: ${{ github.event.inputs.intraday_test_mode || 'true' }}
         run: |
           : "${MEGA_EMAIL:?MEGA_EMAIL secret is required}"
@@ -97,6 +100,10 @@ jobs:
 
           EMA_FAST_PERIOD="${EMA_FAST_PERIOD_OVERRIDE:-9}"
           EMA_SLOW_PERIOD="${EMA_SLOW_PERIOD_OVERRIDE:-21}"
+
+          SR_ENABLED="${SR_ENABLED_OVERRIDE:-true}"
+          SR_LEFT_BARS="${SR_LEFT_BARS_OVERRIDE:-15}"
+          SR_RIGHT_BARS="${SR_RIGHT_BARS_OVERRIDE:-15}"
 
           if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
             TELEGRAM_ENABLED=true
@@ -143,6 +150,9 @@ jobs:
           SENSEX_STRIKE_MAX=${SENSEX_STRIKE_MAX}
           EMA_FAST_PERIOD=${EMA_FAST_PERIOD}
           EMA_SLOW_PERIOD=${EMA_SLOW_PERIOD}
+          SR_ENABLED=${SR_ENABLED}
+          SR_LEFT_BARS=${SR_LEFT_BARS}
+          SR_RIGHT_BARS=${SR_RIGHT_BARS}
           MEGA_ENABLED=true
           MEGA_EMAIL=${MEGA_EMAIL}
           MEGA_PASSWORD=${MEGA_PASSWORD}
@@ -170,6 +180,7 @@ jobs:
           echo "NIFTY fallback range=${NIFTY_STRIKE_MIN}..${NIFTY_STRIKE_MAX}"
           echo "SENSEX fallback range=${SENSEX_STRIKE_MIN}..${SENSEX_STRIKE_MAX}"
           echo "EMA_FAST=${EMA_FAST_PERIOD} EMA_SLOW=${EMA_SLOW_PERIOD}"
+          echo "SR_ENABLED=${SR_ENABLED} SR_LEFT_BARS=${SR_LEFT_BARS} SR_RIGHT_BARS=${SR_RIGHT_BARS}"
           echo "TELEGRAM_ENABLED=${TELEGRAM_ENABLED}"
           echo "MONGO_ENABLED=${MONGO_ENABLED}"
           echo "MONGO_DB_NAME=${MONGO_DB_NAME}"
@@ -191,12 +202,18 @@ jobs:
           find data/ -type f | wc -l || true
           echo "Strike-range log lines (window / mode / candle_ts):"
           grep -E "\[STRIKE-RANGE\]" logs/backup.log 2>/dev/null || true
+          echo "SR level job log lines:"
+          grep -E "SR level job completed|SR level update" logs/backup.log 2>/dev/null | tail -20 || true
           echo "Index folders:"
           ls -R data/index 2>/dev/null | head -50 || true
           echo "Options folders:"
           ls -R data/nifty data/sensex 2>/dev/null | head -50 || true
           echo "all_instruments.json (inside data/):"
           ls -la data/all_instruments.json 2>/dev/null || echo "(not written this run)"
+          echo "SR level files (first 20):"
+          find data -name 'sr_levels.json' -type f 2>/dev/null | head -20 || true
+          echo "SR level file count:"
+          find data -name 'sr_levels.json' -type f 2>/dev/null | wc -l || true
 
       - name: Verify all_instruments.json
         if: always()
@@ -228,6 +245,42 @@ jobs:
                     f"expiry={v.get('expiry')}")
           PY
           fi
+
+      - name: Verify sr_levels.json (sample)
+        if: always()
+        run: |
+          SAMPLE="$(find data -name 'sr_levels.json' -type f 2>/dev/null | head -1)"
+          if [ -z "$SAMPLE" ]; then
+            echo "(no sr_levels.json files written this run)"
+            exit 0
+          fi
+          echo "Verifying sample SR file: ${SAMPLE}"
+          ls -la "$SAMPLE"
+          python - "$SAMPLE" <<'PY'
+          import json, sys
+          p = sys.argv[1]
+          try:
+              doc = json.load(open(p, encoding="utf-8"))
+          except Exception as e:
+              print(f"FAILED to parse {p}: {e}")
+              sys.exit(0)
+          if isinstance(doc, dict):
+              levels = doc.get("levels") or []
+              print(f"count={doc.get('count')} "
+                    f"left_bars={doc.get('left_bars')} "
+                    f"right_bars={doc.get('right_bars')}")
+          else:
+              levels = doc
+              print("legacy list format")
+          total = len(levels)
+          sup = sum(1 for r in levels if r.get("level") == "support")
+          res = total - sup
+          print(f"entries total={total} support={sup} resistance={res}")
+          for i, r in enumerate(levels[:3]):
+              print(f"  sample[{i}] level={r.get('level')} "
+                    f"price={r.get('price')} "
+                    f"confirmed_time={r.get('confirmed_time')}")
+          PY
 
       - name: Upload logs on failure
         if: failure()

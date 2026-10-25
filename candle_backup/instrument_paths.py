@@ -1,3 +1,4 @@
+# candle_backup/instrument_paths.py
 """Path and underlying resolution for the candle cache.
 
 Layout
@@ -6,11 +7,13 @@ Options and futures::
 
     data/<underlying>/<strike>_<strike_type>/candles.json
     data/<underlying>/<strike>_<strike_type>/ema_crosses.json
+    data/<underlying>/<strike>_<strike_type>/sr_levels.json
 
 Index / underlying rows::
 
     data/index/<underlying>/candles.json
     data/index/<underlying>/ema_crosses.json
+    data/index/<underlying>/sr_levels.json
 
 Non-option, non-index instruments (fallback)::
 
@@ -35,7 +38,6 @@ _INDEX_ALIASES: dict[str, str] = {
     "bankex": "bankex",
 }
 
-
 def normalize_underlying_name(name: str) -> str:
     if not isinstance(name, str):
         return "unknown"
@@ -44,12 +46,10 @@ def normalize_underlying_name(name: str) -> str:
         return "unknown"
     return _INDEX_ALIASES.get(raw, raw)
 
-
 def _strip_index_prefix(value: str) -> str:
     if "|" in value:
         return value.split("|", 1)[1]
     return value
-
 
 def is_index_instrument(item: dict[str, Any]) -> bool:
     ikey = str(item.get("instrument_key") or "")
@@ -64,7 +64,6 @@ def is_index_instrument(item: dict[str, Any]) -> bool:
         return True
 
     return False
-
 
 def resolve_underlying(item: dict[str, Any]) -> str:
     for key in ("underlying", "underlying_symbol", "asset", "root_symbol"):
@@ -86,7 +85,6 @@ def resolve_underlying(item: dict[str, Any]) -> str:
         return normalize_underlying_name(_strip_index_prefix(ikey))
 
     return "unknown"
-
 
 def _instrument_dir(item: dict[str, Any]) -> Path:
     underlying = resolve_underlying(item)
@@ -112,20 +110,20 @@ def _instrument_dir(item: dict[str, Any]) -> Path:
 
     return settings.data_dir / underlying / folder
 
-
 def build_candle_path(item: dict[str, Any]) -> Path:
     """Path to the merged candles file (historical + intraday)."""
     return _instrument_dir(item) / "candles.json"
-
 
 def build_ema_path(item: dict[str, Any]) -> Path:
     """Path to the EMA crosses file."""
     return _instrument_dir(item) / "ema_crosses.json"
 
+def build_sr_path(item: dict[str, Any]) -> Path:
+    """Path to the support/resistance levels file."""
+    return _instrument_dir(item) / "sr_levels.json"
 
 _write_locks: dict[str, threading.Lock] = {}
 _write_locks_guard = threading.Lock()
-
 
 def get_file_write_lock(path: Path) -> threading.Lock:
     key = str(path.resolve())

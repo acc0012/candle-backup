@@ -1,3 +1,4 @@
+# candle_backup/cli.py
 """Programmatic entry point used by ``python -m candle_backup``."""
 
 from __future__ import annotations
@@ -53,7 +54,9 @@ async def _do_fetch() -> tuple[int, dict]:
     if not instruments:
         return 3, {"stage": "instruments", "error": "no instruments"}
 
-    logger.info("Fetch: historical + intraday candles and EMA crosses")
+    logger.info(
+        "Fetch: historical + intraday candles, EMA crosses, and SR levels"
+    )
     summary = await historical_candle_store.ensure_candles_and_emas(
         instruments, reason="standalone-backup"
     )
@@ -63,6 +66,7 @@ async def _do_fetch() -> tuple[int, dict]:
         "historical": summary["historical"],
         "intraday": summary["intraday"],
         "ema_crosses": summary["ema_crosses"],
+        "sr_levels": summary["sr_levels"],
     }
 
 
@@ -146,6 +150,7 @@ def _build_metadata(
             "historical": fetch_summary.get("historical"),
             "intraday": fetch_summary.get("intraday"),
             "ema_crosses": fetch_summary.get("ema_crosses"),
+            "sr_levels": fetch_summary.get("sr_levels"),
         }
     else:
         metadata["fetch"] = None
@@ -254,10 +259,17 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
     if fetch_summary:
         details["source"] = "upstox-archive"
         details["instruments"] = fetch_summary.get("instruments")
+
         ema = fetch_summary.get("ema_crosses") or {}
         if ema:
             details["ema_files"] = ema.get("files_written")
             details["ema_total_crosses"] = ema.get("total_crosses")
+
+        sr = fetch_summary.get("sr_levels") or {}
+        if sr and sr.get("enabled"):
+            details["sr_files"] = sr.get("files_written")
+            details["sr_total_levels"] = sr.get("total_levels")
+            details["sr_new_levels"] = sr.get("new_levels")
 
     if backup_summary:
         details["archive"] = backup_summary.get("archive_name")
