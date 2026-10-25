@@ -1,35 +1,11 @@
 # candle_backup/all_instruments_service.py
 """Write a snapshot of every discovered instrument to all_instruments.json.
 
-Output shape — one object keyed by ``instrument_key``::
-
-    {
-      "BSE_FO|866927": {
-        "instrument_key": "BSE_FO|866927",
-        "underlying": "SENSEX",
-        "strike_price": 72100.0,
-        "strike_type": "CE",
-        "expiry": "2026-10-29",
-        "trading_symbol": "SENSEX 72100 CE 29 OCT 26"
-      },
-      "NSE_INDEX|Nifty 50": { ... },
-      ...
-    }
-
-Key notes
----------
-* ``expiry`` is stored as a **readable ISO date** (``"YYYY-MM-DD"``),
-  converted from the raw epoch-ms value in the Upstox archive.
-* Index rows (``NSE_INDEX|…`` / ``BSE_INDEX|…``) carry ``strike_price:
-  null`` and ``strike_type: "INDEX"``.
-* The file is written atomically (``.tmp`` + ``replace``).
-* After the write, the file is **read back** and the entry count is
-  compared against what we intended to write — any mismatch is logged
-  as an error so silent corruption cannot go unnoticed.
-* Explicit counts of index vs option rows are logged. If the write
-  contains index rows but zero options, a loud warning is emitted
-  because that almost always means the strike filter matched nothing.
-* Failures are logged and swallowed — never abort the backup.
+Output shape — one object keyed by ``instrument_key``. Each record
+carries a ``relative_path`` field pointing at the instrument's own
+directory under ``DATA_DIR`` (e.g.
+``"index/nifty/all_instruments.json"`` for an index, or
+``"nifty/22550_PE/all_instruments.json"`` for an option).
 """
 
 from __future__ import annotations
@@ -41,19 +17,23 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from candle_backup.config import settings
+from candle_backup.instrument_paths import (
+    is_index_instrument,
+    relative_dir_for,
+    relative_path_for,
+    resolve_underlying,
+)
 from candle_backup.logger import get_logger
 
 logger = get_logger(__name__)
 
 _MARKET_TZ = ZoneInfo("Asia/Kolkata")
 
-
 # ---------------------------------------------------------------------------
-# Expiry conversion
+# Expiry conversion (unchanged)
 # ---------------------------------------------------------------------------
 
 def _readable_expiry(raw: Any) -> str | None:
-    """Return ``"YYYY-MM-DD"`` from epoch-ms, epoch-s, or ISO string."""
     if raw is None:
         return None
 
@@ -80,14 +60,35 @@ def _readable_expiry(raw: Any) -> str | None:
                 return None
     return None
 
-
 # ---------------------------------------------------------------------------
-# Per-instrument record
+# Per-instrument record (now includes relative_path)
 # ---------------------------------------------------------------------------
 
-def _record_for(item: dict[str, Any]) -> dict[str, Any]:
+def _record_for(item: dict[str, Any], snapshot_path: Path) -> dict[str, Any]:
+    """Build one record with a ``relative_path`` field.
+
+    The ``relative_path`` points to the instrument's own directory,
+    suffixed with ``all_instruments.json`` — i.e. the path a consumer
+    would use if each instrument ever got its own small index file.
+    For the canonical shared snapshot at ``<DATA_DIR>/all_instruments.json``
+    the top-level file is still just ``all_instruments.json``; the
+    per-record value lets a UI build, e.g.::
+
+        data/<relative_path>           # instrument dir
+        data/<relative_path dir>/candles.json
+    """
+    # Directory of the instrument (e.g. "nifty/22550_PE") relative
+    # to DATA_DIR. Empty for the top-level snapshot file itself.
+    dir_rel = relative_dir_for(item) if isinstance(item, dict) else ""
+    if dir_rel:
+        per_record_rel = f"{dir_rel}/all_instruments.json"
+    else:
+        # Fallback: strip the DATA_DIR prefix from the shared file.
+        per_record_rel = relative_path_for(snapshot_path)
+
     return {
         "instrument_key": item.get("instrument_key"),
+        "relative_path": per_record_rel,
         "underlying": (
             item.get("underlying_symbol")
             or item.get("underlying_key")
@@ -100,7 +101,6 @@ def _record_for(item: dict[str, Any]) -> dict[str, Any]:
         "trading_symbol": item.get("trading_symbol"),
     }
 
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -108,11 +108,7 @@ def _record_for(item: dict[str, Any]) -> dict[str, Any]:
 def save_all_instruments(
     instruments: list[dict[str, Any]],
 ) -> Path | None:
-    """Write ``all_instruments.json`` keyed by ``instrument_key``.
-
-    Best-effort: any failure (IO, encoding) is logged and ``None`` is
-    returned so callers can continue.
-    """
+    """Write ``all_instruments.json`` keyed by ``instrument_key``."""
     target = Path(settings.all_instruments_file)
 
     try:
@@ -133,9 +129,15 @@ def save_all_instruments(
         key = item.get("instrument_key")
         if not isinstance(key, str) or not key.strip():
             continue
-        record = _record_for(item)
+        record = _record_for(item, target)
         payload[key.strip()] = record
-        if str(record.get("strike_type") or "").upper() == "INDEX":
+        # Prefer the explicit INDEX tag when present; fall back to
+        # the shared helper so manual list items still classify.
+        is_idx = (
+            str(record.get("strike_type") or "").upper() == "INDEX"
+            or is_index_instrument(item)
+        )
+        if is_idx:
             index_count += 1
         else:
             option_count += 1
@@ -157,7 +159,6 @@ def save_all_instruments(
         len(payload), target, index_count, option_count,
     )
 
-    # ---- Loud warning when only indices landed ----------------------
     if index_count > 0 and option_count == 0:
         logger.warning(
             "all_instruments.json contains ONLY index rows (%d) and no "

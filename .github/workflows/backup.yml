@@ -242,7 +242,8 @@ jobs:
               print("OK — all_instruments.json contains option contracts.")
           for i, (k, v) in enumerate(list(data.items())[:5]):
               print(f"  sample[{i}] {k} -> {v.get('strike_type')} "
-                    f"expiry={v.get('expiry')}")
+                    f"expiry={v.get('expiry')} "
+                    f"relative_path={v.get('relative_path')}")
           PY
           fi
 
@@ -268,7 +269,8 @@ jobs:
               levels = doc.get("levels") or []
               print(f"count={doc.get('count')} "
                     f"left_bars={doc.get('left_bars')} "
-                    f"right_bars={doc.get('right_bars')}")
+                    f"right_bars={doc.get('right_bars')} "
+                    f"relative_path={doc.get('relative_path')}")
           else:
               levels = doc
               print("legacy list format")
@@ -281,6 +283,54 @@ jobs:
                     f"price={r.get('price')} "
                     f"confirmed_time={r.get('confirmed_time')}")
           PY
+
+      - name: Verify relative_path fields
+        if: always()
+        run: |
+          echo "=== relative_path from a sample candles.json ==="
+          SAMPLE_C="$(find data -name 'candles.json' -type f 2>/dev/null | head -1)"
+          if [ -n "$SAMPLE_C" ]; then
+            python - "$SAMPLE_C" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1], encoding="utf-8")).get("relative_path"))
+          PY
+          else
+            echo "(no candles.json files written this run)"
+          fi
+
+          echo "=== relative_path from a sample ema_crosses.json ==="
+          SAMPLE_E="$(find data -name 'ema_crosses.json' -type f 2>/dev/null | head -1)"
+          if [ -n "$SAMPLE_E" ]; then
+            python - "$SAMPLE_E" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1], encoding="utf-8")).get("relative_path"))
+          PY
+          else
+            echo "(no ema_crosses.json files written this run)"
+          fi
+
+          echo "=== relative_path from a sample sr_levels.json ==="
+          SAMPLE_S="$(find data -name 'sr_levels.json' -type f 2>/dev/null | head -1)"
+          if [ -n "$SAMPLE_S" ]; then
+            python - "$SAMPLE_S" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1], encoding="utf-8")).get("relative_path"))
+          PY
+          else
+            echo "(no sr_levels.json files written this run)"
+          fi
+
+          echo "=== relative_path from all_instruments.json (first 3 records) ==="
+          if [ -f data/all_instruments.json ]; then
+            python - data/all_instruments.json <<'PY'
+          import json, sys
+          doc = json.load(open(sys.argv[1], encoding="utf-8"))
+          for i, (k, v) in enumerate(list(doc.items())[:3]):
+              print(f"  {k} -> {v.get('relative_path')}")
+          PY
+          else
+            echo "(all_instruments.json not written this run)"
+          fi
 
       - name: Upload logs on failure
         if: failure()

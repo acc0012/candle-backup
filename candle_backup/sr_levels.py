@@ -12,29 +12,10 @@ Breaks" (LuxAlgo, CC BY-NC-SA 4.0):
   itself — this is exactly the moment ``ta.pivothigh`` /
   ``ta.pivotlow`` return a non-``na`` value in Pine Script.
 
-Every newly confirmed pivot is appended to ``sr_levels.json`` with this
-shape (one object per level)::
-
-    {
-      "level": "resistance",                    # or "support"
-      "price": 24832.5,
-      "confirmed_time": "2026-10-23T14:45:00+05:30",
-      "pivot_time":     "2026-10-23T14:30:00+05:30",
-      "confirmed_bar_index": 3412,
-      "pivot_bar_index":     3427,
-      "left_bars": 15,
-      "right_bars": 15
-    }
-
-Notes
------
-* ``confirmed_bar_index`` is the index of the **confirmation** bar
-  (pivot bar + ``right_bars``). ``pivot_bar_index`` is the swing bar.
-* Existing records are loaded from disk and merged. Re-runs are
-  idempotent: a pivot is only added once, keyed by
-  ``(level, pivot_bar_index)``.
-* The file is written atomically (``.tmp`` + ``replace``).
-* Best-effort: any IO / parse failure is logged and swallowed.
+Every newly confirmed pivot is appended to ``sr_levels.json``. The
+file also carries a top-level ``relative_path`` field describing its
+own location relative to ``DATA_DIR`` (e.g.
+``"nifty/22550_PE/sr_levels.json"``).
 """
 
 from __future__ import annotations
@@ -44,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from candle_backup.instrument_paths import relative_path_for
 from candle_backup.logger import get_logger
 
 logger = get_logger(__name__)
@@ -58,14 +40,11 @@ def _to_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
 
-
 def _candle_high(candle: dict[str, Any]) -> float | None:
     return _to_float(candle.get("high"))
 
-
 def _candle_low(candle: dict[str, Any]) -> float | None:
     return _to_float(candle.get("low"))
-
 
 def find_pivots(
     candles: list[dict[str, Any]],
@@ -96,7 +75,6 @@ def find_pivots(
         )
 
     n = len(candles)
-    # A pivot needs left_bars before + 1 pivot bar + right_bars after.
     if n < left_bars + right_bars + 1:
         return []
 
@@ -164,20 +142,16 @@ def find_pivots(
 
     return pivots
 
-
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
 def _normalize_time_for_sort(value: Any) -> str:
-    """Return a string that sorts chronologically (ISO-like)."""
     if value is None:
         return ""
     return str(value)
 
-
 def _record_key(rec: dict[str, Any]) -> tuple[str, int | None]:
-    """Stable identity of a pivot — one record per confirmed pivot."""
     level = str(rec.get("level") or "").lower()
     idx = rec.get("pivot_bar_index")
     try:
@@ -186,12 +160,7 @@ def _record_key(rec: dict[str, Any]) -> tuple[str, int | None]:
         idx_int = None
     return level, idx_int
 
-
 def load_existing(path: Path) -> list[dict[str, Any]]:
-    """Load and normalize an existing ``sr_levels.json``.
-
-    Returns an empty list on any failure.
-    """
     if not path.exists():
         return []
     try:
@@ -207,14 +176,12 @@ def load_existing(path: Path) -> list[dict[str, Any]]:
         return []
     return [r for r in levels if isinstance(r, dict)]
 
-
 def merge_levels(
     existing: list[dict[str, Any]],
     new: list[dict[str, Any]],
     left_bars: int,
     right_bars: int,
 ) -> list[dict[str, Any]]:
-    """Merge, dedupe by ``(level, pivot_bar_index)``, sort by confirmation."""
     merged: dict[tuple[str, int | None], dict[str, Any]] = {}
 
     def _normalize(rec: dict[str, Any]) -> dict[str, Any]:
@@ -228,12 +195,10 @@ def merge_levels(
     for rec in new:
         key = _record_key(rec)
         if key in merged:
-            # Existing record wins — keeps the original confirmation
-            # timestamp stable across re-runs.
             continue
         merged[key] = _normalize(rec)
 
-    ordered = sorted(
+    return sorted(
         merged.values(),
         key=lambda r: (
             _normalize_time_for_sort(r.get("confirmed_time")),
@@ -241,8 +206,6 @@ def merge_levels(
             int(r.get("pivot_bar_index") or 0),
         ),
     )
-    return ordered
-
 
 def save_levels(
     path: Path,
@@ -251,10 +214,11 @@ def save_levels(
     left_bars: int,
     right_bars: int,
 ) -> None:
-    """Atomically write ``sr_levels.json``."""
+    """Atomically write ``sr_levels.json`` with a ``relative_path`` field."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "relative_path": relative_path_for(path),
         "left_bars": left_bars,
         "right_bars": right_bars,
         "count": len(levels),
@@ -267,9 +231,8 @@ def save_levels(
     )
     tmp.replace(path)
 
-
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry point (unchanged)
 # ---------------------------------------------------------------------------
 
 def update_sr_levels_for_instrument(

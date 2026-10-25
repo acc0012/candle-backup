@@ -18,6 +18,11 @@ Index / underlying rows::
 Non-option, non-index instruments (fallback)::
 
     data/<underlying>/<instrument_type or 'spot'>/candles.json
+
+Every generated JSON file carries a ``relative_path`` field (POSIX
+style, relative to ``settings.data_dir``) so downstream consumers can
+build a path/link without re-deriving the layout. See
+``relative_path_for``.
 """
 
 from __future__ import annotations
@@ -121,6 +126,31 @@ def build_ema_path(item: dict[str, Any]) -> Path:
 def build_sr_path(item: dict[str, Any]) -> Path:
     """Path to the support/resistance levels file."""
     return _instrument_dir(item) / "sr_levels.json"
+
+# ---------------------------------------------------------------------------
+# relative_path helpers
+# ---------------------------------------------------------------------------
+
+def relative_path_for(path: Path) -> str:
+    """Return ``path`` as a POSIX-style string relative to ``DATA_DIR``.
+
+    Falls back to the absolute path (POSIX style) if ``path`` is not
+    under ``DATA_DIR``. Never returns backslashes, so the value is safe
+    to embed in JSON and to use in URLs.
+    """
+    p = Path(path)
+    try:
+        rel = p.resolve().relative_to(settings.data_dir.resolve())
+        return rel.as_posix()
+    except Exception:
+        return p.as_posix()
+
+def relative_dir_for(item: dict[str, Any]) -> str:
+    """Return the instrument directory as a POSIX path relative to DATA_DIR.
+
+    Example: ``"index/nifty"`` or ``"nifty/22550_PE"``.
+    """
+    return relative_path_for(_instrument_dir(item))
 
 _write_locks: dict[str, threading.Lock] = {}
 _write_locks_guard = threading.Lock()

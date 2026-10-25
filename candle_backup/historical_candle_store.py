@@ -6,13 +6,9 @@ Job B — ``ensure_intraday_candles``   (today only)
 Job C — ``compute_ema_crosses``       (writes ema_crosses.json)
 Job D — ``compute_sr_levels``         (writes sr_levels.json)
 
-The four jobs write into the same per-instrument directory::
-
-    data/<underlying>/<strike>_<type>/candles.json
-    data/<underlying>/<strike>_<type>/ema_crosses.json
-    data/<underlying>/<strike>_<type>/sr_levels.json
-
-``ensure_candles_and_emas`` runs all four in order.
+Every JSON artifact now carries a ``relative_path`` field describing
+its own location relative to ``DATA_DIR`` — e.g.
+``"nifty/22550_PE/candles.json"``. See ``instrument_paths.relative_path_for``.
 """
 
 from __future__ import annotations
@@ -30,6 +26,7 @@ from candle_backup.instrument_paths import (
     build_candle_path,
     build_ema_path,
     build_sr_path,
+    relative_path_for,
 )
 from candle_backup.logger import get_logger
 from candle_backup.sr_levels import update_sr_levels_for_instrument
@@ -84,7 +81,7 @@ class HistoricalCandleStore:
         self.sr_failed_count = 0
 
     # ------------------------------------------------------------------ #
-    # Time helpers                                                        #
+    # Time helpers (unchanged)                                            #
     # ------------------------------------------------------------------ #
     def _now_market_tz(self) -> datetime:
         try:
@@ -111,7 +108,7 @@ class HistoricalCandleStore:
         return start <= now.time() < _INTRADAY_WINDOW_END
 
     # ------------------------------------------------------------------ #
-    # Top-level orchestrator                                              #
+    # Top-level orchestrator (unchanged)                                  #
     # ------------------------------------------------------------------ #
     async def ensure_candles_and_emas(
         self,
@@ -195,7 +192,6 @@ class HistoricalCandleStore:
         to_date: date,
         strict: bool,
     ) -> None:
-        # ---- Unchanged from the current file ------------------------
         instrument_key = item.get("instrument_key")
         if not isinstance(instrument_key, str) or not instrument_key.strip():
             self.skipped_count += 1
@@ -249,14 +245,13 @@ class HistoricalCandleStore:
         self._processed_count += 1
 
     # ------------------------------------------------------------------ #
-    # Intraday (unchanged)                                                #
+    # Intraday (unchanged apart from the write path)                      #
     # ------------------------------------------------------------------ #
     async def ensure_intraday_candles(
         self,
         instruments: list[dict[str, Any]],
         reason: str = "backup",
     ) -> dict[str, Any]:
-        # ---- Full body unchanged from current file ------------------
         async with self._lock:
             now_local = self._now_market_tz()
             window_open = self._intraday_window_open(now_local)
@@ -331,7 +326,6 @@ class HistoricalCandleStore:
         item: dict[str, Any],
         cutoff: date,
     ) -> None:
-        # ---- Unchanged from current file ----------------------------
         instrument_key = item.get("instrument_key")
         if not isinstance(instrument_key, str) or not instrument_key.strip():
             self.intraday_empty_count += 1
@@ -367,14 +361,13 @@ class HistoricalCandleStore:
         self._intraday_processed_count += 1
 
     # ------------------------------------------------------------------ #
-    # EMA crosses (unchanged body)                                        #
+    # EMA crosses                                                         #
     # ------------------------------------------------------------------ #
     def compute_ema_crosses(
         self,
         instruments: list[dict[str, Any]],
         reason: str = "backup",
     ) -> dict[str, Any]:
-        # ---- Full body unchanged from current file ------------------
         fast = settings.ema_fast_period
         slow = settings.ema_slow_period
 
@@ -426,8 +419,10 @@ class HistoricalCandleStore:
 
             valid_count = sum(1 for c in crosses if c.get("valid"))
 
+            ema_path = build_ema_path(item)
             payload = {
                 "instrument_key": instrument_key,
+                "relative_path": relative_path_for(ema_path),
                 "underlying": item.get("underlying_symbol")
                 or item.get("underlying_key"),
                 "strike_price": item.get("strike_price"),
@@ -455,7 +450,7 @@ class HistoricalCandleStore:
                 "crosses": crosses,
             }
             try:
-                self._save_ema(build_ema_path(item), payload)
+                self._save_ema(ema_path, payload)
                 self.ema_files_written += 1
                 self.ema_total_crosses += len(crosses)
                 self.ema_valid_crosses += valid_count
@@ -464,7 +459,7 @@ class HistoricalCandleStore:
                 logger.exception(
                     "EMA file write failed; instrument=%s path=%s",
                     instrument_key,
-                    build_ema_path(item),
+                    ema_path,
                 )
 
         summary = {
@@ -480,14 +475,13 @@ class HistoricalCandleStore:
         return summary
 
     # ------------------------------------------------------------------ #
-    # Support / Resistance levels (NEW)                                   #
+    # Support / Resistance levels (unchanged)                             #
     # ------------------------------------------------------------------ #
     def compute_sr_levels(
         self,
         instruments: list[dict[str, Any]],
         reason: str = "backup",
     ) -> dict[str, Any]:
-        """Load each candle file, detect pivots, write sr_levels.json."""
         if not settings.sr_enabled:
             summary = {
                 "reason": reason,
@@ -564,7 +558,7 @@ class HistoricalCandleStore:
         return summary
 
     # ------------------------------------------------------------------ #
-    # Disk IO / freshness (unchanged)                                     #
+    # Disk IO / freshness                                                 #
     # ------------------------------------------------------------------ #
     def _load_existing(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
@@ -583,9 +577,11 @@ class HistoricalCandleStore:
         return [c for c in candles if isinstance(c, dict)]
 
     def _save(self, path: Path, candles: list[dict[str, Any]]) -> None:
+        """Write candles.json with a ``relative_path`` field."""
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "relative_path": relative_path_for(path),
             "count": len(candles),
             "candles": candles,
         }
@@ -598,6 +594,8 @@ class HistoricalCandleStore:
 
     def _save_ema(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # ``relative_path`` already set by the caller for clarity.
+        payload.setdefault("relative_path", relative_path_for(path))
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(
             json.dumps(payload, indent=2, default=_json_default),
