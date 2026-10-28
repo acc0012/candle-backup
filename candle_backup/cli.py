@@ -17,10 +17,8 @@ from candle_backup.telegram_service import telegram_service
 
 logger = get_logger(__name__)
 
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 # ---------------------------------------------------------------------------
 # Instrument discovery
@@ -38,7 +36,6 @@ def _discover_instruments() -> list[dict]:
     contracts = discover_instruments()
     logger.info("Fetch: %d contracts after filtering", len(contracts))
     return contracts
-
 
 # ---------------------------------------------------------------------------
 # Fetch phase
@@ -69,7 +66,6 @@ async def _do_fetch() -> tuple[int, dict]:
         "sr_levels": summary["sr_levels"],
     }
 
-
 # ---------------------------------------------------------------------------
 # Backup phase
 # ---------------------------------------------------------------------------
@@ -91,7 +87,6 @@ def _do_backup(metadata: dict) -> tuple[int, dict]:
     logger.info("Backup: done %s", summary)
     return (0 if summary.get("uploaded") else 1), summary
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -106,7 +101,6 @@ def _format_bytes(n: int | None) -> str:
         size /= 1024.0
         i += 1
     return f"{size:.1f} {units[i]}"
-
 
 def _build_metadata(
     run_started_at: str,
@@ -168,7 +162,6 @@ def _build_metadata(
         metadata["backup"] = None
 
     return metadata
-
 
 # ---------------------------------------------------------------------------
 # Top-level
@@ -278,6 +271,14 @@ async def run(do_fetch: bool, do_backup: bool) -> int:
         )
         details["source_files"] = backup_summary.get("source_file_count")
         details["folder"] = backup_summary.get("folder")
+
+        # Public MEGA share link of the just-uploaded archive.
+        # Rendered as "Mega Link: https://mega.nz/..." in the
+        # Telegram success message. Skipped automatically when the
+        # upload failed or the link could not be retrieved.
+        mega_link = backup_summary.get("file_link")
+        if mega_link:
+            details["mega_link"] = mega_link
 
         mongo_blob = backup_summary.get("mongo_blob") or {}
         if mongo_blob.get("saved"):
