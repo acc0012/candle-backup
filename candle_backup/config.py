@@ -102,6 +102,16 @@ class Settings:
         BASE_DIR / os.getenv("DATA_DIR", "data") / "all_instruments.json",
     )
 
+    # ---- Index-instruments snapshot file ------------------------------
+    # Written by ``index_instruments_service.save_index_instruments`` on
+    # every discovery run. Contains every index row from the raw Upstox
+    # archive (NIFTY 50, SENSEX, BANKNIFTY, FINNIFTY, MIDCPNIFTY, all BSE
+    # indices, …) with instrument_key, trading_symbol and full metadata.
+    index_instruments_file: Path = _env_path(
+        "INDEX_INSTRUMENTS_FILE",
+        BASE_DIR / os.getenv("DATA_DIR", "data") / "index_instruments.json",
+    )
+
     # ---- Underlyings to back up (option chains) -----------------------
     nifty_underlying: str = _env_str("NIFTY_UNDERLYING", "NIFTY")
     sensex_underlying: str = _env_str("SENSEX_UNDERLYING", "SENSEX")

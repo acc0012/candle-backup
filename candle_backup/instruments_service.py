@@ -28,9 +28,19 @@ If Tier 1 fails, Tier 2 is tried; if Tier 2 also yields **zero** option
 contracts, Tier 3 kicks in so the snapshot always contains real option
 strikes whenever the archive carries any.
 
-Every discovery run writes a snapshot of the final instrument list to
-``settings.all_instruments_file`` via
-``all_instruments_service.save_all_instruments``.
+Every discovery run writes two snapshots:
+
+* ``settings.all_instruments_file`` via
+  ``all_instruments_service.save_all_instruments``
+  — one record per instrument we intend to fetch (indices + filtered
+  options), keyed by ``instrument_key``.
+
+* ``settings.index_instruments_file`` via
+  ``index_instruments_service.save_index_instruments``
+  — every index row from the raw archive (NIFTY 50, SENSEX,
+  BANKNIFTY, FINNIFTY, MIDCPNIFTY, all BSE indices, …), listed inside
+  an ``indexs`` array together with its ``instrument_key``,
+  ``trading_symbol`` and the full upstream metadata.
 """
 
 from __future__ import annotations
@@ -48,6 +58,7 @@ import requests
 
 from candle_backup.all_instruments_service import save_all_instruments
 from candle_backup.config import settings
+from candle_backup.index_instruments_service import save_index_instruments
 from candle_backup.logger import get_logger
 from candle_backup.strike_range_service import compute_dynamic_strike_ranges
 
@@ -64,7 +75,6 @@ def _cache_path() -> Path:
     settings.instruments_cache_dir.mkdir(parents=True, exist_ok=True)
     return settings.instruments_cache_dir / "instruments.json.gz"
 
-
 def _cache_is_fresh(path: Path) -> bool:
     if not path.exists():
         return False
@@ -73,7 +83,6 @@ def _cache_is_fresh(path: Path) -> bool:
         return mtime.date() == datetime.now(_MARKET_TZ).date()
     except Exception:
         return False
-
 
 def download_instruments(force: bool = False) -> list[dict[str, Any]]:
     """Return the parsed instrument list, using a same-day disk cache."""
@@ -170,11 +179,9 @@ def _parse_expiry(value: Any) -> datetime | None:
 def _norm(value: Any) -> str:
     return str(value or "").strip().upper().replace("_", " ")
 
-
 def _first_token(value: str) -> str:
     parts = value.split()
     return parts[0] if parts else value
-
 
 def _matches_underlying(item: dict[str, Any], target: str) -> bool:
     t_norm = _norm(target)
@@ -199,10 +206,8 @@ def _strike_of(item: dict[str, Any]) -> float | None:
     except (TypeError, ValueError):
         return None
 
-
 def _now_ist() -> datetime:
     return datetime.now(_MARKET_TZ)
-
 
 def _is_active_option(
     item: dict[str, Any],
@@ -227,7 +232,6 @@ def _is_active_option(
     if _strike_of(item) is None:
         return False
     return True
-
 
 def _auto_detect_strike_range(
     instruments: list[dict[str, Any]],
@@ -451,7 +455,12 @@ def _resolve_range_with_fallback(
 def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
     """Download the archive and return the full instrument list to fetch.
 
-    Also writes ``all_instruments.json`` keyed by ``instrument_key``.
+    Also writes:
+
+    * ``all_instruments.json``  — instrument_key → metadata for every
+      index + option contract we intend to fetch (source: ``combined``).
+    * ``index_instruments.json`` — every index row from the raw archive
+      (source: ``archive``), independent of strike-range filtering.
     """
     archive = download_instruments(force=force_download)
 
@@ -504,6 +513,17 @@ def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
     except Exception:
         logger.exception(
             "all_instruments.json write failed; continuing with backup",
+        )
+
+    # ---- index_instruments.json snapshot ----------------------------
+    # Written from the raw ``archive`` so every index row (NIFTY 50,
+    # SENSEX, BANKNIFTY, FINNIFTY, MIDCPNIFTY, all BSE indices, …) is
+    # captured — not only the two we fetch candles for.
+    try:
+        save_index_instruments(archive)
+    except Exception:
+        logger.exception(
+            "index_instruments.json write failed; continuing with backup",
         )
 
     return combined

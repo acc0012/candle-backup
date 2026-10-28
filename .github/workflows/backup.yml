@@ -59,6 +59,8 @@ jobs:
           MONGO_MAX_BLOB_MB_OVERRIDE: ${{ vars.MONGO_MAX_BLOB_MB }}
           # Optional override — leave unset to use data/all_instruments.json
           ALL_INSTRUMENTS_FILE_OVERRIDE: ${{ vars.ALL_INSTRUMENTS_FILE }}
+          # Optional override — leave unset to use data/index_instruments.json
+          INDEX_INSTRUMENTS_FILE_OVERRIDE: ${{ vars.INDEX_INSTRUMENTS_FILE }}
           NIFTY_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.NIFTY_STRIKE_RANGE_POINTS }}
           SENSEX_STRIKE_RANGE_POINTS_OVERRIDE: ${{ vars.SENSEX_STRIKE_RANGE_POINTS }}
           NIFTY_STRIKE_ROUNDING_OVERRIDE: ${{ vars.NIFTY_STRIKE_ROUNDING }}
@@ -85,6 +87,11 @@ jobs:
           ALL_INSTRUMENTS_LINE=""
           if [ -n "${ALL_INSTRUMENTS_FILE_OVERRIDE}" ]; then
             ALL_INSTRUMENTS_LINE="ALL_INSTRUMENTS_FILE=${ALL_INSTRUMENTS_FILE_OVERRIDE}"
+          fi
+
+          INDEX_INSTRUMENTS_LINE=""
+          if [ -n "${INDEX_INSTRUMENTS_FILE_OVERRIDE}" ]; then
+            INDEX_INSTRUMENTS_LINE="INDEX_INSTRUMENTS_FILE=${INDEX_INSTRUMENTS_FILE_OVERRIDE}"
           fi
 
           NIFTY_STRIKE_RANGE_POINTS="${NIFTY_STRIKE_RANGE_POINTS_OVERRIDE:-500}"
@@ -135,6 +142,7 @@ jobs:
           INSTRUMENTS_URL=https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz
           INSTRUMENTS_CACHE_DIR=data/_cache
           ${ALL_INSTRUMENTS_LINE}
+          ${INDEX_INSTRUMENTS_LINE}
           NIFTY_UNDERLYING=NIFTY
           SENSEX_UNDERLYING=SENSEX
           NIFTY_INDEX_INSTRUMENT_KEY=NSE_INDEX|Nifty 50
@@ -189,6 +197,11 @@ jobs:
           else
             echo "ALL_INSTRUMENTS_FILE=default (<DATA_DIR>/all_instruments.json = data/all_instruments.json)"
           fi
+          if [ -n "${INDEX_INSTRUMENTS_FILE_OVERRIDE}" ]; then
+            echo "INDEX_INSTRUMENTS_FILE=${INDEX_INSTRUMENTS_FILE_OVERRIDE}"
+          else
+            echo "INDEX_INSTRUMENTS_FILE=default (<DATA_DIR>/index_instruments.json = data/index_instruments.json)"
+          fi
 
       - name: Fetch candles and upload to MEGA
         run: python -m candle_backup
@@ -210,6 +223,8 @@ jobs:
           ls -R data/nifty data/sensex 2>/dev/null | head -50 || true
           echo "all_instruments.json (inside data/):"
           ls -la data/all_instruments.json 2>/dev/null || echo "(not written this run)"
+          echo "index_instruments.json (inside data/):"
+          ls -la data/index_instruments.json 2>/dev/null || echo "(not written this run)"
           echo "SR level files (first 20):"
           find data -name 'sr_levels.json' -type f 2>/dev/null | head -20 || true
           echo "SR level file count:"
@@ -244,6 +259,43 @@ jobs:
               print(f"  sample[{i}] {k} -> {v.get('strike_type')} "
                     f"expiry={v.get('expiry')} "
                     f"relative_path={v.get('relative_path')}")
+          PY
+          fi
+
+      - name: Verify index_instruments.json
+        if: always()
+        run: |
+          INDEX_JSON="data/index_instruments.json"
+          echo "Verifying ${INDEX_JSON}:"
+          ls -la "$INDEX_JSON" 2>/dev/null || echo "(not written this run)"
+          if [ -f "$INDEX_JSON" ]; then
+            python - <<'PY'
+          import json, sys
+          p = "data/index_instruments.json"
+          try:
+              doc = json.load(open(p, encoding="utf-8"))
+          except Exception as e:
+              print(f"FAILED to parse {p}: {e}")
+              sys.exit(0)
+          if not isinstance(doc, dict):
+              print(f"FAILED: {p} is not a JSON object (got {type(doc).__name__})")
+              sys.exit(0)
+          total = doc.get("total") or 0
+          items = doc.get("indexs") or []
+          print(f"total={total} entries_in_list={len(items)}")
+          if total == 0:
+              print("::warning::index_instruments.json is empty "
+                    "(no index rows found in the archive).")
+          elif total != len(items):
+              print(f"::warning::index_instruments.json total={total} "
+                    f"but indexs list has {len(items)} entries.")
+          else:
+              print("OK — index_instruments.json looks consistent.")
+          for i, it in enumerate(items[:5]):
+              print(f"  sample[{i}] {it.get('instrument_key')} -> "
+                    f"{it.get('trading_symbol')} "
+                    f"segment={it.get('segment')} "
+                    f"name={it.get('name')}")
           PY
           fi
 
@@ -330,6 +382,21 @@ jobs:
           PY
           else
             echo "(all_instruments.json not written this run)"
+          fi
+
+          echo "=== relative_path from index_instruments.json ==="
+          if [ -f data/index_instruments.json ]; then
+            python - data/index_instruments.json <<'PY'
+          import json, sys
+          doc = json.load(open(sys.argv[1], encoding="utf-8"))
+          print(f"  relative_path={doc.get('relative_path')}")
+          print(f"  total={doc.get('total')}")
+          for i, it in enumerate((doc.get("indexs") or [])[:3]):
+              print(f"  indexs[{i}] {it.get('instrument_key')} -> "
+                    f"{it.get('trading_symbol')}")
+          PY
+          else
+            echo "(index_instruments.json not written this run)"
           fi
 
       - name: Upload logs on failure
