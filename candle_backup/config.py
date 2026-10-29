@@ -175,7 +175,7 @@ class Settings:
     # confirmation moment is explicit.
     sr_enabled: bool = _env_bool("SR_ENABLED", True)
     sr_left_bars: int = _env_int("SR_LEFT_BARS", 15)
-    sr_right_bars: int = _env_int("SR_RIGHT_BARS", 15)
+    sr_right_bars: int = _env_int("SR_RIGHT_BARS", 3)
 
     # ---- MEGA backup --------------------------------------------------
     mega_enabled: bool = _env_bool("MEGA_ENABLED", True)

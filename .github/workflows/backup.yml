@@ -110,7 +110,7 @@ jobs:
 
           SR_ENABLED="${SR_ENABLED_OVERRIDE:-true}"
           SR_LEFT_BARS="${SR_LEFT_BARS_OVERRIDE:-15}"
-          SR_RIGHT_BARS="${SR_RIGHT_BARS_OVERRIDE:-15}"
+          SR_RIGHT_BARS="${SR_RIGHT_BARS_OVERRIDE:-3}"
 
           if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
             TELEGRAM_ENABLED=true
