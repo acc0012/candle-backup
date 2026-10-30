@@ -115,6 +115,12 @@ class Settings:
     # ---- Underlyings to back up (option chains) -----------------------
     nifty_underlying: str = _env_str("NIFTY_UNDERLYING", "NIFTY")
     sensex_underlying: str = _env_str("SENSEX_UNDERLYING", "SENSEX")
+    banknifty_underlying: str = _env_str(
+        "BANKNIFTY_UNDERLYING", "BANKNIFTY"
+    )
+    midcpnifty_underlying: str = _env_str(
+        "MIDCPNIFTY_UNDERLYING", "MIDCPNIFTY"
+    )
 
     nifty_index_instrument_key: str = _env_str(
         "NIFTY_INDEX_INSTRUMENT_KEY", "NSE_INDEX|Nifty 50"
@@ -122,16 +128,38 @@ class Settings:
     sensex_index_instrument_key: str = _env_str(
         "SENSEX_INDEX_INSTRUMENT_KEY", "BSE_INDEX|SENSEX"
     )
+    banknifty_index_instrument_key: str = _env_str(
+        "BANKNIFTY_INDEX_INSTRUMENT_KEY", "NSE_INDEX|Nifty Bank"
+    )
+    midcpnifty_index_instrument_key: str = _env_str(
+        "MIDCPNIFTY_INDEX_INSTRUMENT_KEY", "NSE_INDEX|NIFTY MID SELECT"
+    )
 
     # ---- Dynamic strike ranges ---------------------------------------
-    nifty_strike_range_points: float = 1000.0
-    sensex_strike_range_points: float = 2000.0
+    nifty_strike_range_points: float = _env_float(
+        "NIFTY_STRIKE_RANGE_POINTS", 500.0
+    )
+    sensex_strike_range_points: float = _env_float(
+        "SENSEX_STRIKE_RANGE_POINTS", 1000.0
+    )
+    banknifty_strike_range_points: float = _env_float(
+        "BANKNIFTY_STRIKE_RANGE_POINTS", 1500.0
+    )
+    midcpnifty_strike_range_points: float = _env_float(
+        "MIDCPNIFTY_STRIKE_RANGE_POINTS", 500.0
+    )
 
     nifty_strike_rounding: float = _env_float(
         "NIFTY_STRIKE_ROUNDING", 50.0
     )
     sensex_strike_rounding: float = _env_float(
         "SENSEX_STRIKE_ROUNDING", 100.0
+    )
+    banknifty_strike_rounding: float = _env_float(
+        "BANKNIFTY_STRIKE_ROUNDING", 100.0
+    )
+    midcpnifty_strike_rounding: float = _env_float(
+        "MIDCPNIFTY_STRIKE_ROUNDING", 25.0
     )
 
     strike_range_mode_cutoff_time: str = _env_str(
@@ -142,6 +170,18 @@ class Settings:
     nifty_strike_max: float = _env_float("NIFTY_STRIKE_MAX", 26000.0)
     sensex_strike_min: float = _env_float("SENSEX_STRIKE_MIN", 71000.0)
     sensex_strike_max: float = _env_float("SENSEX_STRIKE_MAX", 73000.0)
+    banknifty_strike_min: float = _env_float(
+        "BANKNIFTY_STRIKE_MIN", 45000.0
+    )
+    banknifty_strike_max: float = _env_float(
+        "BANKNIFTY_STRIKE_MAX", 65000.0
+    )
+    midcpnifty_strike_min: float = _env_float(
+        "MIDCPNIFTY_STRIKE_MIN", 10000.0
+    )
+    midcpnifty_strike_max: float = _env_float(
+        "MIDCPNIFTY_STRIKE_MAX", 15000.0
+    )
 
     # ---- EMA / crosses ------------------------------------------------
     ema_fast_period: int = int(os.getenv("EMA_FAST_PERIOD", "9"))

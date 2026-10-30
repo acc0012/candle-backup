@@ -10,9 +10,10 @@ No authentication is required.
 
 Returned instruments include two categories:
 
-1. The main index rows themselves (``NSE_INDEX|Nifty 50`` and
-   ``BSE_INDEX|SENSEX`` by default) so their candle/EMA series are backed
-   up under ``data/index/<name>/``.
+1. The main index rows themselves (``NSE_INDEX|Nifty 50``,
+   ``BSE_INDEX|SENSEX``, ``NSE_INDEX|Nifty Bank`` and
+   ``NSE_INDEX|NIFTY MID SELECT`` by default) so their candle/EMA
+   series are backed up under ``data/index/<name>/``.
 2. The nearest-expiry CE/PE options per underlying, filtered to a
    **dynamic strike window** derived from the index's intraday candles
    (see ``strike_range_service``).
@@ -20,7 +21,9 @@ Returned instruments include two categories:
 Strike-range resolution is a three-tier fallback per underlying:
 
     Tier 1  dynamic range  (from first/last intraday candle)
-    Tier 2  static range   (NIFTY_STRIKE_MIN/MAX, SENSEX_STRIKE_MIN/MAX)
+    Tier 2  static range   (NIFTY_STRIKE_MIN/MAX, SENSEX_STRIKE_MIN/MAX,
+                            BANKNIFTY_STRIKE_MIN/MAX,
+                            MIDCPNIFTY_STRIKE_MIN/MAX)
     Tier 3  auto-detected range (min..max of every active CE/PE strike
             for that underlying in the archive)
 
@@ -356,6 +359,8 @@ def _build_index_rows() -> list[dict[str, Any]]:
     for key, symbol in (
         (settings.nifty_index_instrument_key, settings.nifty_underlying),
         (settings.sensex_index_instrument_key, settings.sensex_underlying),
+        (settings.banknifty_index_instrument_key, settings.banknifty_underlying),
+        (settings.midcpnifty_index_instrument_key, settings.midcpnifty_underlying),
     ):
         if not key or not symbol:
             continue
@@ -493,18 +498,45 @@ def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
         static_max=settings.sensex_strike_max,
     )
 
+    banknifty_options = _resolve_range_with_fallback(
+        archive,
+        target_upper=settings.banknifty_underlying.upper(),
+        target_orig=settings.banknifty_underlying,
+        dynamic=dynamic,
+        static_min=settings.banknifty_strike_min,
+        static_max=settings.banknifty_strike_max,
+    )
+
+    midcpnifty_options = _resolve_range_with_fallback(
+        archive,
+        target_upper=settings.midcpnifty_underlying.upper(),
+        target_orig=settings.midcpnifty_underlying,
+        dynamic=dynamic,
+        static_min=settings.midcpnifty_strike_min,
+        static_max=settings.midcpnifty_strike_max,
+    )
+
     # ---- Index rows --------------------------------------------------
     indices = _build_index_rows()
 
-    combined = indices + nifty_options + sensex_options
+    combined = (
+        indices
+        + nifty_options
+        + sensex_options
+        + banknifty_options
+        + midcpnifty_options
+    )
     logger.info(
         "Discovered %d instrument(s): %d index rows + %d option contracts "
-        "(NIFTY=%d, SENSEX=%d)",
+        "(NIFTY=%d, SENSEX=%d, BANKNIFTY=%d, MIDCPNIFTY=%d)",
         len(combined),
         len(indices),
-        len(nifty_options) + len(sensex_options),
+        len(nifty_options) + len(sensex_options)
+        + len(banknifty_options) + len(midcpnifty_options),
         len(nifty_options),
         len(sensex_options),
+        len(banknifty_options),
+        len(midcpnifty_options),
     )
 
     # ---- all_instruments.json snapshot -------------------------------
@@ -518,7 +550,7 @@ def discover_instruments(force_download: bool = False) -> list[dict[str, Any]]:
     # ---- index_instruments.json snapshot ----------------------------
     # Written from the raw ``archive`` so every index row (NIFTY 50,
     # SENSEX, BANKNIFTY, FINNIFTY, MIDCPNIFTY, all BSE indices, …) is
-    # captured — not only the two we fetch candles for.
+    # captured — not only the ones we fetch candles for.
     try:
         save_index_instruments(archive)
     except Exception:

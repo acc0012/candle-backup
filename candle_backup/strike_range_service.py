@@ -23,7 +23,11 @@ In both cases a symmetric strike window is built around that close::
     min = floor((close - range_points) / rounding) * rounding
     max = ceil ((close + range_points) / rounding) * rounding
 
-Defaults: NIFTY ±500 rounded to 50; SENSEX ±1000 rounded to 100.
+Defaults:
+    NIFTY      ±500   rounded to 50
+    SENSEX     ±1000  rounded to 100
+    BANKNIFTY  ±1500  rounded to 100
+    MIDCPNIFTY ±500   rounded to 25
 
 Every run logs the selected window + mode + candle timestamp + close,
 e.g.::
@@ -54,7 +58,6 @@ _MARKET_TZ = ZoneInfo("Asia/Kolkata")
 # trading day that actually has non-zero candle data.
 _HISTORICAL_LOOKBACK_DAYS = 10
 
-
 # ---------------------------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------------------------
@@ -70,15 +73,12 @@ def _parse_hhmm(value: str, default: dt_time) -> dt_time:
         )
         return default
 
-
 def _now_ist() -> datetime:
     return datetime.now(_MARKET_TZ)
-
 
 def _is_weekday(dt: datetime) -> bool:
     """True for Mon–Fri (weekday() 0..4)."""
     return dt.weekday() < 5
-
 
 # ---------------------------------------------------------------------------
 # Rounding helpers
@@ -87,17 +87,14 @@ def _is_weekday(dt: datetime) -> bool:
 def _round_down(value: float, step: float) -> float:
     return math.floor(value / step) * step
 
-
 def _round_up(value: float, step: float) -> float:
     return math.ceil(value / step) * step
-
 
 def _safe_float(value: Any) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
-
 
 # ---------------------------------------------------------------------------
 # Intraday candle selection (Mon–Fri path)
@@ -153,7 +150,6 @@ def _pick_candle_close(
 
     return close, mode, str(ts) if ts is not None else None, window_label
 
-
 # ---------------------------------------------------------------------------
 # Historical candles (weekend / fallback path)
 # ---------------------------------------------------------------------------
@@ -193,7 +189,6 @@ def _normalize_historical_candles(response: Any) -> list[dict[str, Any]]:
 
     return normalized
 
-
 def _fetch_historical_candles(
     instrument_key: str,
     from_date: str,
@@ -221,7 +216,6 @@ def _fetch_historical_candles(
         return []
 
     return _normalize_historical_candles(response)
-
 
 def _fetch_last_market_day_candles(
     instrument_key: str,
@@ -264,7 +258,6 @@ def _fetch_last_market_day_candles(
         )
 
     return [], None
-
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -393,7 +386,6 @@ def compute_strike_range(
     )
     return lo, hi
 
-
 def compute_dynamic_strike_ranges() -> dict[str, tuple[float, float]]:
     """Return ``{UNDERLYING: (min, max)}`` for every configured index.
 
@@ -403,20 +395,45 @@ def compute_dynamic_strike_ranges() -> dict[str, tuple[float, float]]:
     """
     ranges: dict[str, tuple[float, float]] = {}
 
-    nifty = compute_strike_range(
-        settings.nifty_index_instrument_key,
-        settings.nifty_strike_range_points,
-        settings.nifty_strike_rounding,
+    specs = (
+        # (instrument_key, underlying, range_points, rounding)
+        (
+            settings.nifty_index_instrument_key,
+            settings.nifty_underlying.upper(),
+            settings.nifty_strike_range_points,
+            settings.nifty_strike_rounding,
+        ),
+        (
+            settings.sensex_index_instrument_key,
+            settings.sensex_underlying.upper(),
+            settings.sensex_strike_range_points,
+            settings.sensex_strike_rounding,
+        ),
+        (
+            settings.banknifty_index_instrument_key,
+            settings.banknifty_underlying.upper(),
+            settings.banknifty_strike_range_points,
+            settings.banknifty_strike_rounding,
+        ),
+        (
+            settings.midcpnifty_index_instrument_key,
+            settings.midcpnifty_underlying.upper(),
+            settings.midcpnifty_strike_range_points,
+            settings.midcpnifty_strike_rounding,
+        ),
     )
-    if nifty is not None:
-        ranges[settings.nifty_underlying.upper()] = nifty
 
-    sensex = compute_strike_range(
-        settings.sensex_index_instrument_key,
-        settings.sensex_strike_range_points,
-        settings.sensex_strike_rounding,
-    )
-    if sensex is not None:
-        ranges[settings.sensex_underlying.upper()] = sensex
+    for instrument_key, underlying, range_points, rounding in specs:
+        if not instrument_key or not underlying:
+            continue
+        result = compute_strike_range(instrument_key, range_points, rounding)
+        if result is not None:
+            ranges[underlying] = result
+        else:
+            logger.warning(
+                "Could not compute dynamic strike range for %s "
+                "(instrument_key=%s); caller will fall back to static",
+                underlying, instrument_key,
+            )
 
     return ranges
